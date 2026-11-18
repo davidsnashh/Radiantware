@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local settings and secrets
+.env
+
+# Runtime data: SQLite cache and the persistent browser profile
+.data/
+
+# macOS
+.DS_Store
