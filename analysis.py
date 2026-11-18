@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from models import MatchDetails, MatchPlayer
+from models import MatchDetails, MatchEntry, MatchPlayer
 from scraper.utils import same_player
 
 
-def find_player(match: MatchDetails, riot_id: str) -> MatchPlayer | None:
-    return next((row for row in match.players if same_player(row.riot_id, riot_id)), None)
+def find_player(
+    match: MatchDetails, riot_id: str, entry: MatchEntry | None = None
+) -> MatchPlayer | None:
+    """Locate the player's scoreboard row.
+
+    Scoreboards keep the name used at the time, so after a Riot ID change the
+    row is recognised by the stat line from the player's match history instead.
+    """
+    row = next((row for row in match.players if same_player(row.riot_id, riot_id)), None)
+    if row is None and entry is not None and entry.agent and entry.kills is not None:
+        line = (entry.agent, entry.kills, entry.deaths, entry.assists)
+        same = [r for r in match.players if (r.agent, r.kills, r.deaths, r.assists) == line]
+        row = same[0] if len(same) == 1 else None
+    return row
 
 
 def team_won(match: MatchDetails, team: str | None) -> bool | None:
@@ -123,12 +135,14 @@ def teammate_stats(
     matches: Sequence[MatchDetails],
     map_name: str | None = None,
     top: int = 10,
+    entries: Mapping[str, MatchEntry] | None = None,
 ) -> dict[str, Any]:
     """Aggregate the players who shared a team with riot_id across the given matches.
 
     Teammates are ranked by games played together over all matches. With
     map_name only teammates seen on that map are listed, each with an extra
-    "on_map" block, while "rank" still reflects the overall ordering.
+    "on_map" block, while "rank" still reflects the overall ordering. entries
+    maps match IDs to the player's history rows, see find_player.
     """
     player = _Tally()
     player_on_map = _Tally()
@@ -138,7 +152,7 @@ def teammate_stats(
     map_label = map_name
 
     for match in matches:
-        me = find_player(match, riot_id)
+        me = find_player(match, riot_id, (entries or {}).get(match.match_id))
         if me is None or me.team is None:
             continue
         won = team_won(match, me.team)

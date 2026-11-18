@@ -12,9 +12,8 @@ import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
@@ -42,7 +41,7 @@ log = logging.getLogger("valorant_trn")
 
 # Both are lazy: nothing touches the disk or starts a browser until a tool needs it.
 cache = SQLiteCache(settings.cache_path)
-scraper = TrackerScraper(settings)
+tracker = TrackerScraper(settings)
 
 # Part of every cache key. Bump it when the cached shapes change.
 CACHE_VERSION = 1
@@ -77,7 +76,7 @@ async def lifespan(_: MCPServer) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        await scraper.close()
+        await tracker.close()
         await cache.close()
 
 
@@ -118,8 +117,9 @@ RefreshArg = Annotated[
 ]
 
 
-@dataclass
-class Loaded:
+# Not a dataclass: "mcp run" imports this file without registering the module,
+# which dataclasses cannot cope with when annotations are strings.
+class Loaded(NamedTuple):
     value: Any
     fetched_at: float
     cached: bool
@@ -229,7 +229,7 @@ async def store_sections(
 
 async def load_profile(rid: RiotId, origin: Provenance, *, force: bool = False) -> PlayerProfile:
     async def fetch() -> dict[str, Any]:
-        profile = await scraper.fetch_profile(rid)
+        profile = await tracker.fetch_profile(rid)
         # The profile response already holds the default act's stats and agents.
         # Store them so the other tools do not have to scrape for the same thing.
         await store_sections(
@@ -258,7 +258,7 @@ async def load_section(
     """One of season_stats, agents or maps for a playlist and act (None means all acts)."""
 
     async def fetch() -> Any:
-        bundle = await scraper.fetch_stats(rid, playlist, season_id)
+        bundle = await tracker.fetch_stats(rid, playlist, season_id)
         # One response feeds all three sections, so keep the other two as well.
         others = [name for name in SECTION_TTLS if name != section]
         await store_sections(rid, playlist, season_id, bundle, others)
@@ -311,7 +311,7 @@ async def load_match_entries(
         pages_left -= 1
 
         async def fetch(page: int = page) -> dict[str, Any]:
-            return (await scraper.fetch_match_page(rid, playlist, page)).dump()
+            return (await tracker.fetch_match_page(rid, playlist, page)).dump()
 
         params = {"playlist": playlist, "page": page}
         loaded = await load(
@@ -332,7 +332,7 @@ async def load_match_entries(
 
 async def load_match(match_id: str) -> MatchDetails:
     async def fetch() -> dict[str, Any]:
-        return (await scraper.fetch_match(match_id)).dump()
+        return (await tracker.fetch_match(match_id)).dump()
 
     loaded = await load("match", "", {"id": match_id}, settings.cache_ttl_match_details, fetch)
     return MatchDetails.model_validate(loaded.value)
@@ -376,7 +376,7 @@ def match_view(
     view["url"] = match_page_url(entry.match_id)
     if entry.rounds_won is not None and entry.rounds_lost is not None:
         view["score"] = f"{entry.rounds_won}-{entry.rounds_lost}"
-    me = analysis.find_player(board, str(rid)) if board else None
+    me = analysis.find_player(board, str(rid), entry) if board else None
     if board is None or me is None:
         view["scoreboard_available"] = False
         return view
@@ -392,13 +392,19 @@ def match_view(
             }
         )
     )
-    allies = [row for row in board.players if row.team == me.team and row is not me]
+
+    def is_ally(row: MatchPlayer) -> bool:
+        # Free-for-all modes have no teams, so everybody else is an opponent.
+        return me.team is not None and row.team == me.team
+
+    others = [row for row in board.players if row is not me]
+    allies = [row for row in others if is_ally(row)]
     view["party_size"] = 1 + sum(
         me.party_id is not None and row.party_id == me.party_id for row in allies
     )
     view["teammates"] = [player_row(row, me.party_id) for row in allies]
     if include_opponents:
-        view["opponents"] = [player_row(row) for row in board.players if row.team != me.team]
+        view["opponents"] = [player_row(row) for row in others if not is_ally(row)]
     return view
 
 
@@ -644,7 +650,8 @@ async def get_teammate_stats(
         entries = await load_match_entries(rid, mode, limit_matches, origin)
         boards = await load_scoreboards(entries, origin, ctx)
         ordered = [boards[entry.match_id] for entry in entries if entry.match_id in boards]
-        summary = analysis.teammate_stats(str(rid), ordered, map_name, top)
+        history = {entry.match_id: entry for entry in entries}
+        summary = analysis.teammate_stats(str(rid), ordered, map_name, top, history)
         return {"riot_id": str(rid), "playlist": mode, **summary, **origin.as_dict()}
 
 
@@ -663,7 +670,7 @@ async def search_player(
         text = query.strip()
 
         async def fetch() -> list[dict[str, Any]]:
-            return [result.dump() for result in await scraper.search(text)]
+            return [result.dump() for result in await tracker.search(text)]
 
         params = {"query": text.casefold()}
         loaded = await load("search", "", params, settings.cache_ttl_search, fetch)

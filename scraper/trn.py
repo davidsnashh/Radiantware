@@ -340,13 +340,13 @@ class FlareSolverrBackend:
 
 
 class RequestPacer:
-    """Spaces requests by a random, human-like gap and enforces an hourly budget."""
+    """Leaves a random, human-like gap between requests and enforces an hourly budget."""
 
     def __init__(self, min_delay: float, max_delay: float, max_per_hour: int) -> None:
         self._min_delay = min_delay
         self._max_delay = max_delay
         self._max_per_hour = max_per_hour
-        self._last_request = 0.0
+        self._last_activity = 0.0
         self._recent: deque[float] = deque()
         self._lock = asyncio.Lock()
 
@@ -361,13 +361,17 @@ class RequestPacer:
                     f"The local budget of {self._max_per_hour} tracker.gg requests per hour "
                     f"is used up. The next request is allowed in about {minutes:.0f} minutes."
                 )
-            if self._last_request:
+            if self._last_activity:
                 gap = random.uniform(self._min_delay, self._max_delay)
-                remaining = self._last_request + gap - now
+                remaining = self._last_activity + gap - now
                 if remaining > 0:
                     await asyncio.sleep(remaining)
-            self._last_request = time.monotonic()
-            self._recent.append(self._last_request)
+            self._last_activity = time.monotonic()
+            self._recent.append(self._last_activity)
+
+    def finished(self) -> None:
+        """Count the gap from the end of a request, however long it took."""
+        self._last_activity = time.monotonic()
 
 
 Subject = Literal["player", "match", "search"]
@@ -485,9 +489,10 @@ class TrackerScraper:
         async with self._semaphore:
             retries = 0
             while True:
+                # Outside the try: an exhausted local budget must not be retried.
                 await self._pacer.wait()
                 try:
-                    return _unwrap(await self._fetch(url), subject, label)
+                    return await self._attempt(url, subject, label)
                 except (UpstreamError, RateLimitedError) as exc:
                     if retries >= self._settings.max_retries:
                         raise
@@ -497,6 +502,13 @@ class TrackerScraper:
                     retries += 1
                     log.warning("request failed (%s); retrying in %.1fs", exc, delay)
                     await asyncio.sleep(delay)
+
+    async def _attempt(self, url: str, subject: Subject, label: str) -> Any:
+        try:
+            result = await self._fetch(url)
+        finally:
+            self._pacer.finished()
+        return _unwrap(result, subject, label)
 
     async def _fetch(self, url: str) -> FetchResult:
         """Try each backend in order, moving on when one is blocked or unavailable."""
