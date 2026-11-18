@@ -4,7 +4,7 @@ Last updated: 18 November 2026
 
 ## Summary
 
-The server is built and working. All 7 tools were run against the live tracker.gg site and returned real data. The newest fixes are in the project folder but were not committed yet when this file was written.
+The server is built and working. All 10 tools were run against the live tracker.gg site and returned real data. The newest changes are in the project folder but were not committed yet when this file was written.
 
 ## What this is
 
@@ -12,15 +12,20 @@ A private MCP server that lets an AI assistant look up Valorant stats. The data 
 
 ## What was built
 
-Seven tools:
+Ten tools:
 
 - `get_player_overview`: rank, peak rank, K/D, headshot %, ADR, ACS, win rate and more
-- `get_player_agents`: stats for each agent
+- `get_player_agents`: stats for each agent and each role
 - `get_player_maps`: stats for each map, split by attack and defense
+- `get_player_weapons`: kills, deaths, headshot % and kill distance for each weapon
 - `get_recent_matches`: recent matches with your teammates and their K/D/A
 - `get_match_details`: the full scoreboard of one match
+- `get_match_rounds`: one match round by round, with every kill in order
+- `get_round_stats`: how rounds go over many matches, for example after the first kill or after a plant
 - `get_teammate_stats`: your most played teammates, their stats, and your record with and without each of them
 - `search_player`: find a Riot ID from a name
+
+Most tools give the main numbers by default and the full stat sheet with `detailed=true`. That adds clutches, multi-kills, trades, rounds survived, first deaths, economy, ability use, attack and defense numbers, buy rounds and kills per weapon. None of it needs extra requests. It all comes in the responses the server already fetched.
 
 Behind the tools:
 
@@ -40,7 +45,10 @@ The tools give an assistant what it needs for questions like "Which of my 5 most
 - Both ways to connect (stdio and HTTP) were tested with a small client script.
 - The FlareSolverr backup was tested with Docker.
 - The fallback to the bundled Chromium browser was tested.
+- The MCP Inspector starts with `uv run mcp dev server.py`, and a live tool call worked through the Inspector's command line mode.
 - A code review found about 14 problems. All were fixed and checked again.
+- The extra stats were checked against tracker.gg's own totals on 5 saved matches and 8 live ones. A second review of that work found about 15 more problems, which were also fixed.
+- The round-by-round data was checked the same way on 7 saved matches and on live ones. A third review found 6 more problems, which were also fixed.
 
 ## What was not tested
 
@@ -48,14 +56,16 @@ The tools give an assistant what it needs for questions like "Which of my 5 most
 - A real Cloudflare block. What the server does after a block was only tested with fake blocks.
 - Console playlists.
 - Windows and Linux. Everything was run on macOS with Python 3.14 and uv.
-- The MCP Inspector window (`uv run mcp dev server.py`). The server does load with `mcp run`, which starts it the same way.
+- Clicking through the MCP Inspector window by hand.
 
 There are no automated tests in the repo. Testing used throwaway scripts with real player data, and those were deleted.
 
 ## Limitations
 
 - RR (rank rating) is only shown for Immortal and Radiant players. Tracker.gg does not have it for lower ranks.
-- MVP counts only exist per act, so all-act totals leave them out.
+- MVPs, trade kills and a few other numbers only exist per act, so all-act totals leave them out.
+- Very long answers are shortened to fit, and the answer says when that happened.
+- Kill positions are map coordinates. Tracker.gg does not name the place, so nothing says "A Main". Only spike plants have a site.
 - It is slow on purpose. Loading 20 new matches takes about a minute the first time. After that they come from the cache.
 - Only one copy of the server should run at a time.
 - If tracker.gg changes its site, the scraper can break. The fixes would go in `scraper/parsers.py`.

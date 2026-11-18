@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import re
@@ -21,13 +22,21 @@ from typing import Annotated, Any, NamedTuple
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
 import analysis
 from cache import SQLiteCache
 from config import get_settings
-from models import MatchDetails, MatchEntry, MatchPage, MatchPlayer, PlayerProfile, StatsBundle
+from models import (
+    MatchDetails,
+    MatchEntry,
+    MatchPage,
+    MatchPlayer,
+    PlayerProfile,
+    Round,
+    StatsBundle,
+)
 from scraper import (
     RiotId,
     TrackerError,
@@ -36,7 +45,7 @@ from scraper import (
     extract_match_id,
     normalize_playlist,
 )
-from scraper.utils import act_number, match_page_url, profile_page_url
+from scraper.utils import act_number, match_page_url, profile_page_url, same_player
 
 settings = get_settings()
 log = logging.getLogger("valorant_trn")
@@ -46,17 +55,60 @@ cache = SQLiteCache(settings.cache_path)
 tracker = TrackerScraper(settings)
 
 # Part of every cache key. Bump it when the cached shapes change.
-CACHE_VERSION = 1
+CACHE_VERSION = 3
 MATCHES_PER_PAGE = 20
 ALL_ACTS = {"all", "all acts", "career", "lifetime", "overall"}
 SECTION_TTLS = {
     "season_stats": settings.cache_ttl_overview,
     "agents": settings.cache_ttl_agents,
+    "roles": settings.cache_ttl_agents,
+    "weapons": settings.cache_ttl_agents,
     "maps": settings.cache_ttl_maps,
 }
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
-# What a teammate or opponent line carries in the match history. The full
-# scoreboard stays available through get_match_details.
+# The headline numbers of a stat row, and the fields that label one. The rest
+# of tracker.gg's stat sheet is returned with detailed=True.
+CORE_STATS = frozenset(
+    {
+        "matches",
+        "wins",
+        "losses",
+        "ties",
+        "win_rate",
+        "kills",
+        "deaths",
+        "assists",
+        "kd",
+        "kda",
+        "acs",
+        "adr",
+        "damage_delta_per_round",
+        "hs_pct",
+        "kast",
+        "first_kills",
+        "first_deaths",
+        "aces",
+        "clutches",
+        "mvps",
+        "rounds",
+        "round_win_rate",
+        "hours_played",
+        "tracker_score",
+    }
+)
+ROW_LABELS = frozenset({"agent", "role", "map", "pick_rate", "top_maps", "top_agents"})
+TOP_ENTRY_KEYS = ("name", "matches", "win_rate")
+# How many agents or maps a detailed call returns when none are named, and how
+# many matches: a full stat sheet is long, and a table of them swamps the reader.
+DETAILED_ROWS = 5
+DETAILED_MATCHES = 8
+# Rows are left off the end of a list once an answer passes this many characters
+# of JSON, roughly 18,000 tokens. MCP clients reject or cut off answers not far
+# above that.
+ANSWER_BUDGET = 48_000
+# Section -> the field that names a row in it.
+ROW_NAMES = {"agents": "agent", "maps": "map", "weapons": "weapon"}
+# What a teammate or opponent line carries in the match history by default.
 SCOREBOARD_KEYS = (
     "riot_id",
     "agent",
@@ -69,7 +121,14 @@ SCOREBOARD_KEYS = (
     "adr",
     "hs_pct",
     "kast",
+    "first_kills",
+    "first_deaths",
 )
+# The large parts of a scoreboard row and of a history row, kept for detailed=True.
+SPLIT_KEYS = ("attack", "defense", "buys", "weapon_kills")
+# What a kill in the round log carries unless detail is asked for.
+KILL_KEYS = ("time", "killer", "victim", "weapon")
+HISTORY_DETAIL = ("tracker_score", "last_deaths", "suicides", "shots_dealt")
 
 
 @asynccontextmanager
@@ -90,11 +149,49 @@ mcp = MCPServer(
         "analysis, map performance comparisons, etc.). Riot IDs look like Name#TAG. Results "
         "are cached, and tracker.gg is scraped slowly on purpose: the first load of a match "
         "scoreboard takes a few seconds, so ask for the smallest limit that answers the "
-        "question. Percentages are on a 0-100 scale. Data belongs to Tracker Network."
+        "question. Percentages are on a 0-100 scale. Data belongs to Tracker Network.\n\n"
+        "Most tools return the headline numbers by default and the full stat sheet with "
+        "detailed=true. Fields tracker.gg has no value for are left out. Stat names are the "
+        "same in every tool: acs is combat score per "
+        "round, adr damage per round, kast the share of rounds with a kill, assist, survival "
+        "or trade. first_kills and first_deaths count rounds in which the player got the "
+        "first kill or was the first of all ten to die, team_first_deaths rounds in which "
+        "they were the first of their own team to die, and entry_success_rate is first kills "
+        "as a share of the rounds they opened either way. deaths_traded are deaths a teammate "
+        "avenged and trade_kills kills that avenged a teammate. multi_kills are rounds with "
+        "three or more kills, and double_kills, triple_kills and quadra_kills rounds with "
+        "exactly two, three and four. aces are rounds with five kills on a scoreboard and "
+        "tracker.gg's own ace count on profile rows. clutches_by_size is keyed 1v1 to 1v5. "
+        "econ_rating "
+        "is damage per 1000 credits spent, tracker_score tracker.gg's rating out of 1000, "
+        "and ability_casts is keyed by ability slot (c, q, e, x). attack and defense blocks "
+        "split a player's numbers by side, and buys by tracker.gg's buy type (pistol, eco, "
+        "semi, full). get_match_rounds tells one match round by round, kill by kill, and "
+        "get_round_stats sums up how rounds go over many matches."
     ),
     log_level=settings.log_level,
     lifespan=lifespan,
 )
+
+
+def tool(
+    handler: Callable[..., Awaitable[dict[str, Any]]],
+) -> Callable[..., Awaitable[CallToolResult]]:
+    """Register a read-only tool whose answer goes out as compact JSON.
+
+    Left to the SDK the text is indented, and about a third of it is whitespace.
+    """
+
+    @functools.wraps(handler)
+    async def compact_answer(*args: Any, **kwargs: Any) -> CallToolResult:
+        data = await handler(*args, **kwargs)
+        text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        return CallToolResult(
+            content=[TextContent(type="text", text=text)], structured_content=data
+        )
+
+    return mcp.tool(annotations=READ_ONLY)(compact_answer)
+
 
 RiotIdArg = Annotated[
     str, Field(description='Riot ID in the form "Name#TAG", for example "Player#NA1".')
@@ -116,6 +213,13 @@ SeasonArg = Annotated[
 ]
 RefreshArg = Annotated[
     bool, Field(description="Ignore the cache and scrape tracker.gg again. Use sparingly.")
+]
+DetailedArg = Annotated[
+    bool,
+    Field(
+        description="Return the full stat sheet instead of the headline numbers. The answer "
+        "gets several times longer, so only ask when the question needs it."
+    ),
 ]
 
 
@@ -266,7 +370,7 @@ async def load_profile(rid: RiotId, origin: Provenance, *, force: bool = False) 
                 profile.default_playlist,
                 profile.default_season,
                 profile.stats,
-                ("season_stats", "agents"),
+                ("season_stats", "agents", "roles"),
             )
         return profile.dump()
 
@@ -284,11 +388,11 @@ async def load_section(
     *,
     force: bool = False,
 ) -> Any:
-    """One of season_stats, agents or maps for a playlist and act (None means all acts)."""
+    """One section of SECTION_TTLS for a playlist and act (None means all acts)."""
 
     async def fetch() -> Any:
         bundle = await tracker.fetch_stats(rid, playlist, season_id)
-        # One response feeds all three sections, so keep the other two as well.
+        # One response feeds every section, so keep the others as well.
         others = [name for name in SECTION_TTLS if name != section]
         await store_sections(rid, playlist, season_id, bundle, others)
         return dump_section(bundle, section)
@@ -303,6 +407,40 @@ async def load_section(
 
 def squash(text: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+
+
+def stat_view(row: dict[str, Any], detailed: bool) -> dict[str, Any]:
+    """A stat row as the tools return it: the whole sheet, or the headline numbers."""
+    if detailed:
+        return row
+    view = {key: value for key, value in row.items() if key in CORE_STATS or key in ROW_LABELS}
+    for key in ("top_maps", "top_agents"):
+        if key in view:
+            view[key] = [
+                {name: entry[name] for name in TOP_ENTRY_KEYS if name in entry}
+                for entry in view[key]
+            ]
+    return view
+
+
+def fit(rows: list[dict[str, Any]], budget: int = ANSWER_BUDGET) -> list[dict[str, Any]]:
+    """The leading rows that fit in one answer. The first row is always kept."""
+    used = 0
+    for count, row in enumerate(rows):
+        used += len(json.dumps(row, separators=(",", ":")))
+        if used > budget and count:
+            return rows[:count]
+    return rows
+
+
+def side_headlines(row: dict[str, Any]) -> dict[str, Any]:
+    """Round win rate and K/D per side, as flat keys for a row without the side blocks."""
+    flat = {}
+    for side in ("attack", "defense"):
+        split = row.get(side) or {}
+        flat[f"{side}_round_win_rate"] = split.get("round_win_rate")
+        flat[f"{side}_kd"] = split.get("kd")
+    return compact(flat)
 
 
 def resolve_season(profile: PlayerProfile, season: str) -> str | None:
@@ -417,20 +555,32 @@ async def load_scoreboards(
     return boards
 
 
-def player_row(row: MatchPlayer, party_id: str | None = None) -> dict[str, Any]:
+def player_row(
+    row: MatchPlayer, party_id: str | None = None, *, detailed: bool = False
+) -> dict[str, Any]:
+    """A scoreboard line: the core numbers, or with detailed everything but the splits."""
     full = row.dump()
-    data = {key: full[key] for key in SCOREBOARD_KEYS if key in full}
+    if detailed:
+        data = {k: v for k, v in full.items() if k not in ("team", "party_id", *SPLIT_KEYS)}
+    else:
+        data = {key: full[key] for key in SCOREBOARD_KEYS if key in full}
     if party_id is not None:
         data["in_party"] = row.party_id == party_id
     return data
 
 
 def match_view(
-    rid: RiotId, entry: MatchEntry, board: MatchDetails | None, include_opponents: bool
+    rid: RiotId,
+    entry: MatchEntry,
+    board: MatchDetails | None,
+    include_opponents: bool,
+    detailed: bool = False,
 ) -> dict[str, Any]:
     """One match from the player's point of view, with teammates when the scoreboard is known."""
     view = entry.dump()
-    view.pop("combat_score", None)
+    if not detailed:
+        for key in ("combat_score", *HISTORY_DETAIL):
+            view.pop(key, None)
     view["url"] = match_page_url(entry.match_id)
     if entry.rounds_won is not None and entry.rounds_lost is not None:
         view["score"] = f"{entry.rounds_won}-{entry.rounds_lost}"
@@ -439,17 +589,22 @@ def match_view(
         view["scoreboard_available"] = False
         return view
 
-    view.update(
-        compact(
-            {
-                "duration_minutes": board.duration_minutes,
-                "first_kills": me.first_kills,
-                "first_deaths": me.first_deaths,
-                "plants": me.plants,
-                "defuses": me.defuses,
-            }
+    if board.duration_minutes is not None:
+        view["duration_minutes"] = board.duration_minutes
+    if detailed:
+        mine = player_row(me, detailed=True)
+        view.update({key: value for key, value in mine.items() if key != "riot_id"})
+    else:
+        view.update(
+            compact(
+                {
+                    "first_kills": me.first_kills,
+                    "first_deaths": me.first_deaths,
+                    "plants": me.plants,
+                    "defuses": me.defuses,
+                }
+            )
         )
-    )
 
     def is_ally(row: MatchPlayer) -> bool:
         # Free-for-all modes have no teams, so everybody else is an opponent.
@@ -460,13 +615,52 @@ def match_view(
     view["party_size"] = 1 + sum(
         me.party_id is not None and row.party_id == me.party_id for row in allies
     )
-    view["teammates"] = [player_row(row, me.party_id) for row in allies]
+    view["teammates"] = [player_row(row, me.party_id, detailed=detailed) for row in allies]
     if include_opponents:
-        view["opponents"] = [player_row(row) for row in others if not is_ally(row)]
+        view["opponents"] = [
+            player_row(row, detailed=detailed) for row in others if not is_ally(row)
+        ]
     return view
 
 
-@mcp.tool(annotations=READ_ONLY)
+def round_view(
+    entry: Round,
+    score: dict[str, int],
+    team_of: dict[str, str | None],
+    focus: str | None,
+    detailed: bool,
+) -> dict[str, Any]:
+    """One round of the log: the result, both teams' economy and the kills in order."""
+    data = entry.dump()
+    kills = data.pop("kills", [])
+    lines = data.pop("players", [])
+    by_team: dict[str, list[dict[str, Any]]] = {}
+    for line, row in zip(lines, entry.players or [], strict=True):
+        team = team_of.get(row.riot_id)
+        if team:
+            by_team.setdefault(team, []).append(line)
+    economy = {}
+    for team in by_team:
+        rows = [row for row in entry.players or [] if team_of.get(row.riot_id) == team]
+        economy[team] = compact(
+            {
+                "buy": analysis.team_buy(rows),
+                "loadout_value": sum(row.loadout_value or 0 for row in rows),
+                "spent": sum(row.spent or 0 for row in rows),
+            }
+        )
+    if not detailed:
+        kills = [{key: kill[key] for key in KILL_KEYS if key in kill} for kill in kills]
+    view = {**data, "score": score, "economy": economy or None, "kills": kills}
+    if focus:
+        mine = next((line for line in lines if same_player(line["riot_id"], focus)), None)
+        view["player"] = mine and {key: value for key, value in mine.items() if key != "riot_id"}
+    if detailed:
+        view["players"] = by_team or None
+    return compact(view)
+
+
+@tool
 async def get_player_overview(
     riot_id: RiotIdArg,
     playlist: PlaylistArg = "competitive",
@@ -474,6 +668,7 @@ async def get_player_overview(
     include_career: Annotated[
         bool, Field(description="Also return all-act totals under 'career'.")
     ] = True,
+    detailed: DetailedArg = False,
     force_refresh: RefreshArg = False,
 ) -> dict[str, Any]:
     """Headline stats for a player: rank, peak rank and overall performance.
@@ -481,10 +676,19 @@ async def get_player_overview(
     Returns rank (tier, plus rr and leaderboard_rank for Immortal and above,
     the only ranks tracker.gg has a rating for), peak_rank, and a stats block
     with matches, wins, losses, win_rate, kd, kda, acs, adr, hs_pct, kast,
-    kills, deaths, assists, first_bloods, aces, clutches and hours_played for
-    the chosen act. "percentiles" compares the player with everyone tracked,
-    and "career" holds the same stat block across all acts. "seasons" (newest
-    first) and "playlists" list what the season and playlist arguments accept.
+    kills, deaths, assists, first_kills, first_deaths, aces, clutches,
+    tracker_score and hours_played for the chosen act. "percentiles" compares
+    the player with everyone tracked, and "career" holds the stat block across
+    all acts, without the few numbers tracker.gg only has per act (mvps,
+    tracker_score, and in the full sheet trade_kills and thrifty_rounds).
+    "seasons" (newest first) and "playlists" list what the season and playlist
+    arguments accept.
+
+    detailed=true turns both stat blocks into the full sheet: attack and
+    defense blocks, clutches won and lost by size, multi-kills, trades, rounds
+    survived, last deaths, entry success, plants and defuses, econ rating,
+    ability casts, shots dealt and received by body part, flawless and thrifty
+    rounds, team aces, total damage and more.
     """
     with tool_errors():
         rid = RiotId.parse(riot_id)
@@ -498,6 +702,11 @@ async def get_player_overview(
             rid, "season_stats", mode, season_id, origin, force=force_refresh and not is_default
         )
         stats = dict(stats or {})
+        rank = stats.pop("rank", None)
+        peak_rank = stats.pop("peak_rank", None) or (
+            profile.peak_rank.dump() if profile.peak_rank else None
+        )
+        percentiles = stats.pop("percentiles", None)
 
         career = None
         if include_career and season_id is not None:
@@ -509,11 +718,6 @@ async def get_player_overview(
             hidden = ("rank", "peak_rank", "percentiles")
             career = {k: v for k, v in career.items() if k not in hidden}
 
-        rank = stats.pop("rank", None)
-        peak_rank = stats.pop("peak_rank", None) or (
-            profile.peak_rank.dump() if profile.peak_rank else None
-        )
-        percentiles = stats.pop("percentiles", None)
         return compact(
             {
                 "riot_id": profile.riot_id or str(rid),
@@ -524,9 +728,9 @@ async def get_player_overview(
                 "season": season_label(profile, season_id),
                 "rank": rank,
                 "peak_rank": peak_rank,
-                "stats": stats or None,
+                "stats": stat_view(stats, detailed) or None,
                 "percentiles": percentiles,
-                "career": career or None,
+                "career": stat_view(career or {}, detailed) or None,
                 "note": None if stats else f"No {mode} games recorded for this act.",
                 "seasons": [act.short_name or act.name or act.id for act in profile.seasons],
                 "playlists": profile.playlists,
@@ -535,63 +739,150 @@ async def get_player_overview(
         )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 async def get_player_agents(
     riot_id: RiotIdArg,
     playlist: PlaylistArg = "competitive",
     season: SeasonArg = "current",
+    agents: Annotated[
+        list[str] | None, Field(description='Only these agents, for example ["Jett", "Omen"].')
+    ] = None,
+    detailed: DetailedArg = False,
     force_refresh: RefreshArg = False,
 ) -> dict[str, Any]:
-    """Per-agent performance for a player, most played first.
+    """Per-agent performance for a player, most played first, plus totals per role.
 
-    Each entry has agent, role, matches, wins, losses, win_rate, kd, kda, acs,
-    adr, hs_pct, kast, kills, deaths, assists, hours_played and top_maps (the
-    maps the agent was played on most). Use season="all" for lifetime numbers.
+    Each agent has agent, role, pick_rate, matches, wins, losses, win_rate,
+    kd, kda, acs, adr, hs_pct, kast, kills, deaths, assists, first_kills,
+    first_deaths, aces, clutches, hours_played and top_maps (the maps the
+    agent was played on most). "roles" has the main numbers per role
+    (duelist, initiator, controller, sentinel). Use season="all" for lifetime
+    numbers.
+
+    detailed=true returns the full stat sheet per agent, as described for
+    get_player_overview, with "abilities" (the name and casts of each
+    ability) in place of ability_casts, and with kd, acs, adr, hs_pct, kast,
+    kills, deaths and assists on every top_maps entry. Detailed rows are
+    long, so name the agents you want. Without names only the five most
+    played are returned and "not_shown" lists the rest.
     """
     with tool_errors():
-        return await _stat_rows(riot_id, "agents", playlist, season, force_refresh)
+        return await _stat_rows(
+            riot_id, "agents", playlist, season, force_refresh, agents, detailed
+        )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 async def get_player_maps(
+    riot_id: RiotIdArg,
+    playlist: PlaylistArg = "competitive",
+    season: SeasonArg = "current",
+    maps: Annotated[
+        list[str] | None, Field(description='Only these maps, for example ["Split", "Ascent"].')
+    ] = None,
+    detailed: DetailedArg = False,
+    force_refresh: RefreshArg = False,
+) -> dict[str, Any]:
+    """Per-map performance for a player, most played first.
+
+    Each entry has map, matches, wins, losses, win_rate, kd, kda, acs, adr,
+    hs_pct, kast, kills, deaths, assists, first_kills, first_deaths, aces,
+    clutches, attack_round_win_rate, defense_round_win_rate, attack_kd,
+    defense_kd and top_agents (the agents played most on that map). Use
+    season="all" for lifetime numbers.
+
+    detailed=true returns the full stat sheet per map, as described for
+    get_player_overview, with attack and defense blocks in place of the four
+    flat side numbers, and with kd, acs, adr, hs_pct, kast, kills, deaths and
+    assists on every top_agents entry. Detailed rows are long, so name the
+    maps you want. Without names only the five most played are returned and
+    "not_shown" lists the rest.
+    """
+    with tool_errors():
+        return await _stat_rows(riot_id, "maps", playlist, season, force_refresh, maps, detailed)
+
+
+@tool
+async def get_player_weapons(
     riot_id: RiotIdArg,
     playlist: PlaylistArg = "competitive",
     season: SeasonArg = "current",
     force_refresh: RefreshArg = False,
 ) -> dict[str, Any]:
-    """Per-map performance for a player, most played first.
+    """Per-weapon performance for a player, most kills first.
 
-    Each entry has map, matches, wins, losses, win_rate, kd, acs, adr, hs_pct,
-    kast, attack_round_win_rate, defense_round_win_rate, attack_kd, defense_kd
-    and top_agents (the agents played most on that map). Use season="all" for
-    lifetime numbers.
+    Each entry has weapon, category, matches and rounds (in which it was
+    used), kills, deaths (times the player was killed by that weapon), kd,
+    alt_fire_kills, hs_pct, damage, damage_received (taken from that weapon,
+    which tracker.gg only has per act), shots_dealt (head, body, leg),
+    avg_kill_distance_m and longest_kill_m. Abilities that deal weapon-like
+    damage are listed too. Use season="all" for lifetime numbers.
     """
     with tool_errors():
-        return await _stat_rows(riot_id, "maps", playlist, season, force_refresh)
+        return await _stat_rows(riot_id, "weapons", playlist, season, force_refresh)
 
 
 async def _stat_rows(
-    riot_id: str, section: str, playlist: str, season: str, force: bool
+    riot_id: str,
+    section: str,
+    playlist: str,
+    season: str,
+    force: bool,
+    only: list[str] | None = None,
+    detailed: bool = False,
 ) -> dict[str, Any]:
     rid = RiotId.parse(riot_id)
     mode = normalize_playlist(playlist)
     origin = Provenance()
     profile = await load_profile(rid, origin)
     season_id = resolve_season(profile, season)
-    rows = await load_section(rid, section, mode, season_id, origin, force=force)
+    rows = await load_section(rid, section, mode, season_id, origin, force=force) or []
+    label = ROW_NAMES[section]
+    notes = [] if rows else [f"No {mode} games recorded for this scope."]
+    not_shown = None
+    if only:
+        wanted = {squash(name) for name in only}
+        known = {squash(row.get(label)) for row in rows}
+        missing = [name for name in only if squash(name) not in known]
+        if missing and rows:
+            notes.append(f"Nothing recorded for {', '.join(missing)} in this scope.")
+        rows = [row for row in rows if squash(row.get(label)) in wanted]
+    elif detailed and len(rows) > DETAILED_ROWS:
+        not_shown = [row.get(label) for row in rows[DETAILED_ROWS:]]
+        rows = rows[:DETAILED_ROWS]
+        notes.append(
+            f"Detailed rows are limited to the {DETAILED_ROWS} most played. "
+            "Name the others to see them."
+        )
+
+    def view(row: dict[str, Any]) -> dict[str, Any]:
+        if section == "weapons":
+            return row
+        shown = stat_view(row, detailed)
+        if section == "maps" and not detailed:
+            top_agents = shown.pop("top_agents", None)
+            shown = compact({**shown, **side_headlines(row), "top_agents": top_agents})
+        return shown
+
+    shown = fit([view(row) for row in rows])
+    if len(shown) < len(rows):
+        not_shown = [row.get(label) for row in rows[len(shown) :]] + (not_shown or [])
+        notes.append(f"Only {len(shown)} rows fit in one answer. Name fewer at a time.")
+    result: dict[str, Any] = {
+        "riot_id": profile.riot_id or str(rid),
+        "playlist": mode,
+        "season": season_label(profile, season_id),
+        section: shown,
+    }
+    if section == "agents":
+        roles = await load_section(rid, "roles", mode, season_id, origin)
+        result["roles"] = [stat_view(row, False) for row in roles or []]
     return compact(
-        {
-            "riot_id": profile.riot_id or str(rid),
-            "playlist": mode,
-            "season": season_label(profile, season_id),
-            section: rows or [],
-            "note": None if rows else f"No {mode} games recorded for this scope.",
-            **origin.as_dict(),
-        }
+        {**result, "not_shown": not_shown, "note": " ".join(notes) or None, **origin.as_dict()}
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 async def get_recent_matches(
     riot_id: RiotIdArg,
     ctx: Context,
@@ -602,19 +893,32 @@ async def get_recent_matches(
     include_opponents: Annotated[
         bool, Field(description="Also list the five enemy players of every match.")
     ] = False,
+    detailed: DetailedArg = False,
+    skip: Annotated[
+        int,
+        Field(ge=0, le=200, description="Leave out this many of the newest matches, to page back."),
+    ] = 0,
     force_refresh: RefreshArg = False,
 ) -> dict[str, Any]:
     """Recent match history with the player's own line and every teammate's line.
 
     Each match has match_id, url, played_at, map, mode, result (victory or
     defeat), score, agent, kills, deaths, assists, kd, acs, adr, hs_pct, kast,
-    damage, performance_rank (the player's position among all ten players by
-    tracker.gg's performance score), party_size and teammates. Every teammate
-    entry has riot_id, agent,
-    rank, kills, deaths, assists, kd, acs, adr, hs_pct, kast and in_party
-    (true when they queued together with the player). Group by teammate
-    riot_id and filter by map to compare teammates, or call
-    get_teammate_stats, which does that aggregation.
+    damage, first_kills, first_deaths, plants, defuses, performance_rank (the
+    player's position among all ten players by tracker.gg's performance
+    score), party_size and teammates. Every teammate entry has riot_id, agent,
+    rank, kills, deaths, assists, kd, acs, adr, hs_pct, kast, first_kills,
+    first_deaths and in_party (true when they queued together with the
+    player). Group by teammate riot_id and filter by map to compare
+    teammates, or call get_teammate_stats, which does that aggregation.
+
+    detailed=true gives the player and every teammate the whole scoreboard
+    line listed under get_match_details (clutches, multi-kills, trades,
+    economy, ability casts and so on). That is long, so a detailed call
+    returns at most eight matches. Use get_teammate_stats for totals.
+
+    An answer holds only so much: when the matches asked for do not fit, the
+    oldest are left off and "note" says which skip value continues from there.
 
     Scoreboards are scraped one match at a time on first use and cached for
     weeks afterwards, so a cold call takes a few seconds per match.
@@ -623,36 +927,67 @@ async def get_recent_matches(
         rid = RiotId.parse(riot_id)
         mode = normalize_playlist(playlist)
         origin = Provenance()
-        entries = await load_match_entries(rid, mode, limit, origin, force=force_refresh)
+        wanted = min(limit, DETAILED_MATCHES) if detailed else limit
+        entries = await load_match_entries(rid, mode, skip + wanted, origin, force=force_refresh)
+        entries = entries[skip:]
         boards = await load_scoreboards(entries, origin, ctx)
-        matches = [
-            match_view(rid, entry, boards.get(entry.match_id), include_opponents)
+        views = [
+            match_view(rid, entry, boards.get(entry.match_id), include_opponents, detailed)
             for entry in entries
         ]
-        return {
-            "riot_id": str(rid),
-            "playlist": mode,
-            "count": len(matches),
-            "matches": matches,
-            **origin.as_dict(),
-        }
+        matches = fit(views)
+        note = None
+        if len(matches) < len(views) or (wanted < limit and len(views) == wanted):
+            note = (
+                f"{len(matches)} matches fit in this answer. "
+                f"Call again with skip={skip + len(matches)} for older ones."
+            )
+        return compact(
+            {
+                "riot_id": str(rid),
+                "playlist": mode,
+                "count": len(matches),
+                "matches": matches,
+                "note": note,
+                **origin.as_dict(),
+            }
+        )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
 async def get_match_details(
     match_id_or_url: Annotated[
         str, Field(description="A match ID (UUID) or a tracker.gg match URL.")
     ],
+    detailed: DetailedArg = False,
 ) -> dict[str, Any]:
     """Full scoreboard of one match: both teams and all ten players.
 
     Returns map, mode, played_at, duration_minutes, rounds and a list of teams
-    with won, rounds_won, rounds_lost and players. Each player has riot_id,
-    agent, rank, party_id (players sharing one queued together), kills,
-    deaths, assists, kd, acs, adr, hs_pct, kast, damage, combat_score,
-    first_kills, first_deaths, plants, defuses and performance_rank (position
-    among all ten players by tracker.gg's performance score, which is not the
-    order by combat score).
+    with won, rounds_won, rounds_lost, surrendered (set on a team that gave
+    up), started_on (attack or defense), round_wins (rounds won by how they
+    ended), plants_by_site and players.
+    Each player has riot_id, agent, rank, account_level, party_id (players
+    sharing one queued together), kills, deaths, assists, kd, acs, adr,
+    hs_pct, kast, damage, damage_received, damage_delta_per_round,
+    combat_score, shots_dealt and shots_received (hits by body part: head,
+    body, leg), first_kills, first_deaths, team_first_deaths,
+    entry_success_rate, rounds_survived, deaths_traded, trade_kills, clutches,
+    clutches_lost, clutches_by_size, clutches_lost_by_size, multi_kills,
+    double_kills, triple_kills, quadra_kills, aces, plants, defuses,
+    econ_rating, avg_loadout_value, credits_spent, ability_casts,
+    tracker_score, performance_score, performance_rank (position among all
+    ten players by performance_score, which is not the order by combat score)
+    and tags (tracker.gg's labels for the match, such as "Top Frag").
+
+    detailed=true adds to every player attack and defense blocks, buys (their
+    rounds by buy type) and weapon_kills, and to the match a round_log with
+    the winner, the ending and the plant site of every round. The kills of
+    each round are in get_match_rounds.
+
+    A free-for-all such as deathmatch has no teams, so its players are listed
+    under "players" instead, and modes without rounds have no side, buy or
+    round numbers.
     """
     with tool_errors():
         match_id = extract_match_id(match_id_or_url)
@@ -661,7 +996,22 @@ async def get_match_details(
         origin.add(loaded)
         board = MatchDetails.model_validate(loaded.value)
         result = board.dump()
-        players = result.pop("players", [])
+        result.pop("round_log", None)
+        round_log = [
+            compact(
+                {
+                    "round": entry.round,
+                    "winner": entry.winner,
+                    "ending": entry.ending,
+                    "plant_site": entry.plant.site if entry.plant else None,
+                }
+            )
+            for entry in board.round_log or []
+        ]
+        hidden = () if detailed else SPLIT_KEYS
+        players = [
+            {k: v for k, v in row.items() if k not in hidden} for row in result.pop("players", [])
+        ]
         result["url"] = match_page_url(match_id)
         if board.teams:
             for team in result["teams"]:
@@ -671,38 +1021,141 @@ async def get_match_details(
                     if row.get("team") == team["team"]
                 ]
         else:
+            result.pop("teams", None)
             result["players"] = players
+        if detailed and round_log:
+            result["round_log"] = round_log
         return {**result, **origin.as_dict()}
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def get_teammate_stats(
+@tool
+async def get_match_rounds(
+    match_id_or_url: Annotated[
+        str, Field(description="A match ID (UUID) or a tracker.gg match URL.")
+    ],
+    rounds: Annotated[
+        list[int] | None, Field(description="Only these round numbers, for example [1, 13].")
+    ] = None,
+    riot_id: Annotated[
+        str | None, Field(description="Also show this player's own line in every round.")
+    ] = None,
+    detailed: DetailedArg = False,
+) -> dict[str, Any]:
+    """Round-by-round account of one match: how each round went and the kills in order.
+
+    Every round has round, winner, ending (Elimination, Defuse, Detonate or
+    Time), attackers (the team on attack), score (rounds each team has won
+    after it), plant and defuse (by, site, and time in seconds into the
+    round), economy (per team: buy, the buy type most of its players were on,
+    with loadout_value and spent added up) and kills in the order they
+    happened. A kill has time (seconds into the round), killer, victim and
+    weapon. A kill whose killer is the victim is a suicide or the spike, and
+    one within a team is a team kill. Neither counts as a kill on the
+    scoreboard or in a player's line, while the death does, except a death to
+    the spike. "teams" lists each team's players, and marks a team that
+    surrendered.
+
+    With riot_id every round also has "player", that player's line: buy
+    (pistol, eco, semi or full, by credits spent), loadout_value, spent,
+    remaining, score, kills, deaths, assists and damage, or "away" for a
+    round they were not in the game for.
+
+    detailed=true adds to every kill the assists, distance_m and the minimap
+    positions killer_at and victim_at ([x, y], each from 0 at the top left to
+    1), and to every round "players" with the line of all ten by team. That
+    is long, so name the rounds you want. Rounds that do not fit are left off
+    and "note" says which.
+    """
+    with tool_errors():
+        match_id = extract_match_id(match_id_or_url)
+        focus = str(RiotId.parse(riot_id)) if riot_id else None
+        origin = Provenance()
+        loaded = await load_match(match_id)
+        origin.add(loaded)
+        board = MatchDetails.model_validate(loaded.value)
+        if not board.round_log:
+            raise ToolError("Tracker.gg has no round-by-round data for this match.")
+        team_of = {row.riot_id: row.team for row in board.players}
+        if focus and not any(same_player(name, focus) for name in team_of):
+            raise ToolError(f"{focus} did not play in this match.")
+
+        score: dict[str, int] = {team.team: 0 for team in board.teams}
+        views = []
+        for entry in board.round_log:
+            if entry.winner:
+                score[entry.winner] = score.get(entry.winner, 0) + 1
+            if not rounds or entry.round in rounds:
+                views.append(round_view(entry, dict(score), team_of, focus, detailed))
+        shown = fit(views)
+        note = None
+        if len(shown) < len(views):
+            left = ", ".join(str(view["round"]) for view in views[len(shown) :])
+            note = f"Did not fit in this answer: round {left}. Ask for them with rounds."
+        elif not views:
+            played = board.round_log
+            note = f"No such round. This match has rounds {played[0].round} to {played[-1].round}."
+        return compact(
+            {
+                "match_id": board.match_id,
+                "url": match_page_url(match_id),
+                "map": board.map,
+                "mode": board.mode,
+                "played_at": board.played_at,
+                "teams": [
+                    compact(
+                        {
+                            "team": team.team,
+                            "won": team.won,
+                            "rounds_won": team.rounds_won,
+                            "surrendered": team.surrendered,
+                            "started_on": team.started_on,
+                            "players": [
+                                name for name, side in team_of.items() if side == team.team
+                            ],
+                        }
+                    )
+                    for team in board.teams
+                ],
+                "rounds": shown,
+                "note": note,
+                **origin.as_dict(),
+            }
+        )
+
+
+@tool
+async def get_round_stats(
     riot_id: RiotIdArg,
     ctx: Context,
     map_name: Annotated[
-        str | None,
-        Field(description='Only consider teammates seen on this map, for example "Split".'),
+        str | None, Field(description='Only count matches on this map, for example "Split".')
     ] = None,
     limit_matches: Annotated[
         int, Field(ge=1, le=100, description="How many recent matches to analyse.")
     ] = 30,
     playlist: PlaylistArg = "competitive",
-    top: Annotated[int, Field(ge=1, le=25, description="How many teammates to return.")] = 10,
 ) -> dict[str, Any]:
-    """Most played teammates over the player's recent matches, with their stats.
+    """How rounds go for the player's team over their recent matches.
 
-    Teammates are ordered by games played together across all analysed
-    matches, and "rank" is that position, so the first five entries are the
-    five most played teammates. Each has games_together, games_in_party,
-    wins, losses, win_rate, kills, deaths, assists, kd, acs, adr, hs_pct,
-    kast, agents, by_map (games, win_rate, kd and acs per map),
-    your_record_with and your_record_without (the player's own results with
-    and without that teammate).
+    Built from the round-by-round data of every analysed match. Each block
+    counts rounds, the ones the player's team won, and win_rate:
 
-    With map_name, only teammates who shared that map are listed and each gets
-    an on_map block with their numbers on it. For example "which of my five
-    most played teammates has the lowest KD on Split" is answered by calling
-    this with map_name="Split" and comparing on_map.kd among rank 1 to 5.
+    - rounds overall, and attack and defense. Each side also has spike_planted
+      and spike_not_planted (on attack: after the team planted, on defense:
+      after the enemy planted, so that one is the retake rate) and by_site
+    - pistol_rounds (the first round of each half), after_pistol_win and
+      after_pistol_loss (the round that follows)
+    - opening.first_kill and opening.first_death: rounds in which the team got
+      the first kill, or lost the first player
+    - economy: rounds by both teams' buy, as "<own buy> vs <enemy buy>", where
+      a team's buy is the type most of its players were on (pistol, eco, semi
+      or full)
+    - endings: how the rounds the team won and lost ended
+    - you: the player's own opening duels (first_kill and first_death, with
+      how the round then went), avg_kill_time and avg_death_time (seconds
+      into the round), avg_kill_distance_m and avg_death_distance_m, and
+      killed_by (the weapons that killed them most). These cover fights with
+      the enemy only, not a suicide, the spike or a team kill
 
     A cold call scrapes one scoreboard per match at a few seconds each. Later
     calls reuse the cache.
@@ -715,11 +1168,90 @@ async def get_teammate_stats(
         boards = await load_scoreboards(entries, origin, ctx)
         ordered = [boards[entry.match_id] for entry in entries if entry.match_id in boards]
         history = {entry.match_id: entry for entry in entries}
-        summary = analysis.teammate_stats(str(rid), ordered, map_name, top, history)
+        summary = analysis.round_stats(str(rid), ordered, map_name, history)
         return {"riot_id": str(rid), "playlist": mode, **summary, **origin.as_dict()}
 
 
-@mcp.tool(annotations=READ_ONLY)
+@tool
+async def get_teammate_stats(
+    riot_id: RiotIdArg,
+    ctx: Context,
+    map_name: Annotated[
+        str | None,
+        Field(description='Only consider teammates seen on this map, for example "Split".'),
+    ] = None,
+    limit_matches: Annotated[
+        int, Field(ge=1, le=100, description="How many recent matches to analyse.")
+    ] = 30,
+    playlist: PlaylistArg = "competitive",
+    top: Annotated[int, Field(ge=1, le=25, description="How many teammates to return.")] = 10,
+    detailed: DetailedArg = False,
+) -> dict[str, Any]:
+    """Most played teammates over the player's recent matches, with their stats.
+
+    Teammates are ordered by games played together across all analysed
+    matches, and "rank" is that position, so the first five entries are the
+    five most played teammates. Each has games_together, games_in_party,
+    account_level, wins, losses, win_rate, kills, deaths, assists, kd, acs,
+    adr, hs_pct, kast, damage_delta_per_round, rounds, agents, by_map (games,
+    win_rate, kd and acs per map), your_record_with and your_record_without
+    (the player's own results with and without that teammate), and these
+    totals, most with a rate next to them:
+
+    - first_kills, first_deaths and team_first_deaths, with first_kill_rate,
+      first_death_rate and team_first_death_rate (percent of the rounds
+      played together), and entry_success_rate
+    - rounds_survived with survival_rate
+    - deaths_traded with deaths_traded_rate (percent of their deaths that a
+      teammate avenged), and trade_kills
+    - clutches and clutches_lost with clutch_win_rate and clutches_by_size
+    - multi_kills, double_kills, triple_kills, quadra_kills and aces
+    - plants, defuses, econ_rating, avg_loadout_value, tracker_score and
+      ability_casts
+
+    Compare teammates by the rates and averages rather than the totals, since
+    they played different numbers of games. "Which of my five most played
+    teammates dies first the most" is the highest first_death_rate among rank
+    1 to 5.
+
+    With map_name, only teammates who shared that map are listed and each gets
+    an on_map block with their numbers on it. For example "which of my five
+    most played teammates has the lowest KD on Split" is answered by calling
+    this with map_name="Split" and comparing on_map.kd among rank 1 to 5.
+
+    detailed=true adds attack and defense blocks, buys (by buy type),
+    weapon_kills and tags to every teammate and to your_stats. That is long,
+    so ask for few teammates: the ones that do not fit in one answer are left
+    off and "note" says so.
+
+    Fields with no data are left out, for example the rates of a teammate who
+    never opened a round, or your_record_without for one who was in every
+    match.
+
+    A cold call scrapes one scoreboard per match at a few seconds each. Later
+    calls reuse the cache.
+    """
+    with tool_errors():
+        rid = RiotId.parse(riot_id)
+        mode = normalize_playlist(playlist)
+        origin = Provenance()
+        entries = await load_match_entries(rid, mode, limit_matches, origin)
+        boards = await load_scoreboards(entries, origin, ctx)
+        ordered = [boards[entry.match_id] for entry in entries if entry.match_id in boards]
+        history = {entry.match_id: entry for entry in entries}
+        summary = analysis.teammate_stats(str(rid), ordered, map_name, top, history, detailed)
+        rows = summary["teammates"]
+        rest = len(json.dumps({key: value for key, value in summary.items() if key != "teammates"}))
+        summary["teammates"] = fit(rows, ANSWER_BUDGET - rest)
+        if len(summary["teammates"]) < len(rows):
+            summary["note"] = (
+                f"Only the first {len(summary['teammates'])} of {len(rows)} teammates fit in "
+                "one answer. Ask for fewer, or without detailed."
+            )
+        return {"riot_id": str(rid), "playlist": mode, **summary, **origin.as_dict()}
+
+
+@tool
 async def search_player(
     query: Annotated[
         str, Field(min_length=2, description="Start of a Riot ID, for example a player name.")
