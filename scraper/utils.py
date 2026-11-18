@@ -1,0 +1,135 @@
+"""Riot ID parsing, playlist names and tracker.gg URL building."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from urllib.parse import quote, unquote, urlencode
+
+from .exceptions import InvalidRiotIdError
+
+SITE_BASE = "https://tracker.gg/valorant"
+API_BASE = "https://api.tracker.gg/api/v2/valorant/standard"
+
+_PROFILE_URL_RE = re.compile(r"/profile/riot/([^/?#]+)", re.IGNORECASE)
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_MATCH_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+_PLAYLIST_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+_PLAYLIST_ALIASES = {
+    "ranked": "competitive",
+    "comp": "competitive",
+    "normal": "unrated",
+    "unranked": "unrated",
+    "dm": "deathmatch",
+    "tdm": "team-deathmatch",
+    "spike-rush": "spikerush",
+    "swift-play": "swiftplay",
+    "snowball-fight": "snowball",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class RiotId:
+    name: str
+    tag: str
+
+    @classmethod
+    def parse(cls, raw: str) -> RiotId:
+        """Accept "Name#TAG" with stray whitespace, a URL-encoded ID or a profile URL."""
+        text = (raw or "").strip()
+        url_match = _PROFILE_URL_RE.search(text)
+        if url_match:
+            text = url_match.group(1)
+        if _PERCENT_ESCAPE_RE.search(text):
+            text = unquote(text)
+        # Full-width "＃" is what some IMEs produce.
+        name, sep, tag = text.replace("＃", "#").rpartition("#")
+        name, tag = " ".join(name.split()), tag.strip()
+        if not sep or not name or not tag:
+            raise InvalidRiotIdError(
+                f"'{raw}' is not a Riot ID. Expected the form Name#TAG, for example Player#NA1."
+            )
+        if not 3 <= len(name) <= 16 or "#" in name:
+            raise InvalidRiotIdError(f"'{raw}': the name part of a Riot ID is 3 to 16 characters.")
+        if not 3 <= len(tag) <= 5 or not tag.isalnum():
+            raise InvalidRiotIdError(
+                f"'{raw}': the tagline of a Riot ID is 3 to 5 letters or digits."
+            )
+        return cls(name, tag)
+
+    def __str__(self) -> str:
+        return f"{self.name}#{self.tag}"
+
+    @property
+    def key(self) -> str:
+        """Case-insensitive form used for cache keys and comparisons."""
+        return str(self).casefold()
+
+    @property
+    def encoded(self) -> str:
+        return quote(str(self), safe="")
+
+
+def same_player(a: str | None, b: str | None) -> bool:
+    return bool(a) and bool(b) and a.casefold() == b.casefold()
+
+
+def normalize_playlist(value: str | None) -> str:
+    """Map user-facing names ("ranked", "Spike Rush") onto tracker.gg playlist keys."""
+    key = re.sub(r"[\s_]+", "-", (value or "competitive").strip().casefold())
+    key = _PLAYLIST_ALIASES.get(key, key)
+    if not _PLAYLIST_RE.fullmatch(key):
+        raise InvalidRiotIdError(
+            f"'{value}' is not a playlist. Try competitive, unrated, swiftplay, spikerush, "
+            "deathmatch, team-deathmatch or premier."
+        )
+    return key
+
+
+def extract_match_id(value: str) -> str:
+    """Pull the match UUID out of a bare ID or a tracker.gg match URL."""
+    found = _MATCH_ID_RE.search(value or "")
+    if not found:
+        raise InvalidRiotIdError(
+            f"'{value}' does not contain a match ID. Pass the UUID or a tracker.gg match URL."
+        )
+    return found.group(0).lower()
+
+
+def profile_page_url(riot_id: RiotId) -> str:
+    return f"{SITE_BASE}/profile/riot/{riot_id.encoded}/overview"
+
+
+def match_page_url(match_id: str) -> str:
+    return f"{SITE_BASE}/match/{match_id}"
+
+
+def profile_url(riot_id: RiotId) -> str:
+    return f"{API_BASE}/profile/riot/{riot_id.encoded}"
+
+
+def segments_url(riot_id: RiotId, playlist: str, season_id: str | None) -> str:
+    """All stat segments for one act, or for every act when season_id is None."""
+    if season_id:
+        query = {"playlist": playlist, "seasonId": season_id, "source": "web"}
+        return f"{profile_url(riot_id)}/segments/season?{urlencode(query)}"
+    return f"{profile_url(riot_id)}/segments/playlist?{urlencode({'playlist': playlist, 'source': 'web'})}"
+
+
+def matches_url(riot_id: RiotId, playlist: str, page: int = 0) -> str:
+    query: dict[str, str | int] = {"platform": "pc", "type": playlist}
+    if page:
+        query["next"] = page
+    return f"{API_BASE}/matches/riot/{riot_id.encoded}?{urlencode(query)}"
+
+
+def match_url(match_id: str) -> str:
+    return f"{API_BASE}/matches/{match_id}"
+
+
+def search_url(query: str) -> str:
+    params = {"platform": "riot", "query": query, "autocomplete": "true"}
+    return f"{API_BASE}/search?{urlencode(params)}"

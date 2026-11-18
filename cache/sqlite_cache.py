@@ -117,11 +117,15 @@ class SQLiteCache:
     def _get(self, key: Key, allow_stale: bool) -> CacheEntry | None:
         try:
             with self._lock:
-                row = self._connect().execute(
-                    "SELECT value, created_at, expires_at FROM cache"
-                    " WHERE tool = ? AND riot_id = ? AND params = ?",
-                    key,
-                ).fetchone()
+                row = (
+                    self._connect()
+                    .execute(
+                        "SELECT value, created_at, expires_at FROM cache"
+                        " WHERE tool = ? AND riot_id = ? AND params = ?",
+                        key,
+                    )
+                    .fetchone()
+                )
             if row is None:
                 return None
             entry = CacheEntry(json.loads(row[0]), row[1], row[2])
