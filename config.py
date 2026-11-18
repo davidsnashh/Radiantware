@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -88,6 +88,19 @@ class Settings(BaseSettings):
         return self.data_dir / "browser-profile"
 
 
+def _env_name(field: object) -> str:
+    name = str(field)
+    return name if name.isupper() else f"TRN_{name.upper()}"
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    try:
+        return Settings()
+    except ValidationError as exc:
+        # A plain message instead of a pydantic traceback in the MCP client's log.
+        problems = "; ".join(
+            f"{_env_name(error['loc'][0]) if error['loc'] else 'settings'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise SystemExit(f"Invalid configuration. {problems}") from None

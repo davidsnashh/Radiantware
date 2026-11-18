@@ -24,6 +24,8 @@ from models import (
     TopEntry,
 )
 
+from .utils import act_label
+
 _PRE_RE = re.compile(r"<pre[^>]*>(.*?)</pre>", re.DOTALL | re.IGNORECASE)
 _TIER_ICON_RE = re.compile(r"/(\d+)\.png")
 
@@ -114,7 +116,7 @@ def _rank(stat: Any) -> Rank | None:
         tier_id=tier_id,
         rr=round(value) if is_rating else None,
         leaderboard_rank=position if isinstance(position, int) else None,
-        act=meta.get("actName"),
+        act=act_label(meta.get("actName")),
     )
 
 
@@ -189,15 +191,19 @@ def parse_stats_bundle(segments: list[dict[str, Any]]) -> StatsBundle:
         meta = segment.get("metadata") or {}
         stats = segment.get("stats") or {}
         name = meta.get("name") or "Unknown"
+        line = _stat_line(stats)
+        if kind == "playlist" or ("seasonId" in attrs and attrs["seasonId"] is None):
+            # Tracker.gg does not count MVPs across acts and sends a flat 0 instead.
+            line["mvps"] = None
         if kind in ("season", "playlist") and overall is None:
             overall = SeasonStats(
-                **_stat_line(stats),
+                **line,
                 rank=_rank(stats.get("rank")),
                 peak_rank=_rank(stats.get("peakRank")),
                 percentiles=_percentiles(stats),
             )
         elif kind == "agent":
-            agents.append(AgentStats(agent=name, role=meta.get("role"), **_stat_line(stats)))
+            agents.append(AgentStats(agent=name, role=meta.get("role"), **line))
         elif kind == "map":
             maps[attrs.get("key") or name] = MapStats(
                 map=name,
@@ -205,7 +211,7 @@ def parse_stats_bundle(segments: list[dict[str, Any]]) -> StatsBundle:
                 defense_round_win_rate=_float(stats, "defenseRoundsWinPct", 1),
                 attack_kd=_float(stats, "attackKDRatio"),
                 defense_kd=_float(stats, "defenseKDRatio"),
-                **_stat_line(stats),
+                **line,
             )
         elif kind == "agent-top-map" and attrs.get("mapKey"):
             maps_by_agent.setdefault(name, []).append((attrs["mapKey"], stats))
@@ -280,7 +286,7 @@ def parse_match_page(data: dict[str, Any]) -> MatchPage:
                 played_at=meta.get("timestamp"),
                 map=meta.get("mapName"),
                 mode=meta.get("modeName"),
-                season=meta.get("seasonName"),
+                season=act_label(meta.get("seasonName")),
                 result=meta.get("result") or segment_meta.get("result"),
                 rounds_won=_int(stats, "roundsWon"),
                 rounds_lost=_int(stats, "roundsLost"),
@@ -296,7 +302,7 @@ def parse_match_page(data: dict[str, Any]) -> MatchPage:
                 kast=_float(stats, "kAST", 1),
                 damage=_int(stats, "damage"),
                 combat_score=_int(stats, "score"),
-                placement=_int(stats, "placement"),
+                performance_rank=_int(stats, "placement"),
             )
         )
     next_page = (data.get("metadata") or {}).get("next")
@@ -329,7 +335,7 @@ def _match_player(segment: dict[str, Any]) -> MatchPlayer:
         first_deaths=_int(stats, "firstDeaths"),
         plants=_int(stats, "plants"),
         defuses=_int(stats, "defuses"),
-        placement=_int(stats, "placement"),
+        performance_rank=_int(stats, "placement"),
     )
 
 

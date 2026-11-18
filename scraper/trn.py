@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import random
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -47,11 +49,8 @@ _ANCHOR_URL = "https://tracker.gg/robots.txt"
 _CHALLENGE_URL = "https://tracker.gg/valorant"
 _CHALLENGE_TITLES = ("just a moment", "attention required", "access denied")
 
-_BLOCKED_HELP = (
-    "Cloudflare is blocking automated access to tracker.gg right now. Wait a few minutes, "
-    "or set TRN_HEADLESS=false so the challenge can be solved in a visible browser window "
-    "(the clearance is remembered), or configure FLARESOLVERR_URL as a fallback."
-)
+# How long a backend is left alone after Cloudflare blocked it.
+_BLOCK_COOLDOWN = 300.0
 
 _FETCH_JS = """
 async ({url, timeout}) => {
@@ -114,7 +113,10 @@ class PlaywrightBackend:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        # _lock serialises requests, _lifecycle_lock serialises starting and stopping.
         self._lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_tasks: set[asyncio.Task[None]] = set()
         self._driver: Any = None
         self._context: Any = None
         self._page: Any = None
@@ -131,7 +133,7 @@ class PlaywrightBackend:
                 raise
             except Exception as exc:
                 # Usually a crashed or closed browser, so start clean next time.
-                await self._shutdown()
+                await self._run_to_completion(self._stop)
                 raise UpstreamError(f"Browser request failed: {_first_line(exc)}") from exc
             finally:
                 self._schedule_idle_close()
@@ -139,7 +141,7 @@ class PlaywrightBackend:
     async def close(self) -> None:
         self._cancel_idle_close()
         async with self._lock:
-            await self._shutdown()
+            await self._run_to_completion(self._stop)
 
     async def _fetch(self, url: str) -> FetchResult:
         page = await self._ensure_page()
@@ -151,11 +153,13 @@ class PlaywrightBackend:
             result = await self._fetch_in_page(page, url)
             if result.status == 0:
                 raise CloudflareBlockedError(
-                    f"The browser could not reach tracker.gg's data API ({result.body}). "
-                    + _BLOCKED_HELP
+                    f"The browser could not reach tracker.gg's data API ({result.body}), "
+                    "which usually means Cloudflare is blocking it."
                 )
             if self._is_blocked(result):
-                raise CloudflareBlockedError(_BLOCKED_HELP)
+                raise CloudflareBlockedError(
+                    "Cloudflare keeps challenging requests to tracker.gg's data API."
+                )
         return result
 
     @staticmethod
@@ -174,8 +178,7 @@ class PlaywrightBackend:
         return FetchResult(raw["status"], raw["body"])
 
     async def _ensure_page(self) -> Any:
-        if self._context is None:
-            await self._launch()
+        await self._run_to_completion(self._start)
         page = self._page
         if page is None or page.is_closed():
             pages = self._context.pages
@@ -194,10 +197,37 @@ class PlaywrightBackend:
             if not any(marker in title for marker in _CHALLENGE_TITLES):
                 return
             if time.monotonic() >= deadline:
-                raise CloudflareBlockedError(_BLOCKED_HELP)
+                raise CloudflareBlockedError(
+                    "Cloudflare showed a challenge that did not clear within "
+                    f"{self._settings.challenge_timeout:.0f} seconds."
+                )
             await asyncio.sleep(1)
 
-    async def _launch(self) -> None:
+    async def _run_to_completion(self, step: Callable[[], Awaitable[None]]) -> None:
+        """Run a start or stop step that keeps going even if the caller is cancelled.
+
+        A tool call can be cancelled at any await. Abandoning a launch or a
+        teardown half way would leak a browser that keeps the profile locked.
+        """
+
+        async def run() -> None:
+            async with self._lifecycle_lock:
+                await step()
+
+        task = asyncio.ensure_future(run())
+        self._lifecycle_tasks.add(task)
+        task.add_done_callback(self._lifecycle_done)
+        await asyncio.shield(task)
+
+    def _lifecycle_done(self, task: asyncio.Task[None]) -> None:
+        self._lifecycle_tasks.discard(task)
+        # Collect the outcome so an abandoned step does not log an unretrieved exception.
+        if not task.cancelled():
+            task.exception()
+
+    async def _start(self) -> None:
+        if self._context is not None:
+            return
         api = _load_playwright()
         self._settings.browser_profile_dir.mkdir(parents=True, exist_ok=True)
         driver = await api.async_playwright().start()
@@ -223,6 +253,8 @@ class PlaywrightBackend:
             raise
         self._driver = driver
         log.info("browser started (headless=%s)", self._settings.headless)
+        # Covers a launch whose caller was cancelled and so never schedules this itself.
+        self._schedule_idle_close()
 
     def _launch_targets(self) -> list[dict[str, str]]:
         if self._settings.browser_executable:
@@ -235,9 +267,6 @@ class PlaywrightBackend:
         context = await self._open_context(driver, target)
         if self._user_agent_checked:
             return context
-        # Headless Chrome calls itself "HeadlessChrome", which is the one thing
-        # Cloudflare challenges here. Relaunch with the same user agent minus that
-        # word; a launch flag keeps client hints intact, unlike a CDP override.
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             native = await page.evaluate("navigator.userAgent")
@@ -245,12 +274,15 @@ class PlaywrightBackend:
             with contextlib.suppress(Exception):
                 await context.close()
             raise
+        if "Headless" in native:
+            # Headless Chrome calls itself "HeadlessChrome", which is the one thing
+            # Cloudflare challenges here. Relaunch with the same user agent minus that
+            # word; a launch flag keeps client hints intact, unlike a CDP override.
+            self._user_agent = native.replace("Headless", "")
+            await context.close()
+            context = await self._open_context(driver, target)
         self._user_agent_checked = True
-        if "Headless" not in native:
-            return context
-        await context.close()
-        self._user_agent = native.replace("Headless", "")
-        return await self._open_context(driver, target)
+        return context
 
     async def _open_context(self, driver: Any, target: dict[str, str]) -> Any:
         args = [f"--user-agent={self._user_agent}"] if self._user_agent else []
@@ -262,15 +294,17 @@ class PlaywrightBackend:
             **target,
         )
 
-    async def _shutdown(self) -> None:
+    async def _stop(self) -> None:
         context, driver = self._context, self._driver
         self._context = self._page = self._driver = None
-        if context is not None:
-            with contextlib.suppress(Exception):
-                await context.close()
-        if driver is not None:
-            with contextlib.suppress(Exception):
-                await driver.stop()
+        try:
+            if context is not None:
+                with contextlib.suppress(Exception):
+                    await context.close()
+        finally:
+            if driver is not None:
+                with contextlib.suppress(Exception):
+                    await driver.stop()
 
     def _cancel_idle_close(self) -> None:
         if self._idle_task is not None:
@@ -278,6 +312,7 @@ class PlaywrightBackend:
             self._idle_task = None
 
     def _schedule_idle_close(self) -> None:
+        self._cancel_idle_close()
         if self._context is not None and self._settings.browser_idle_seconds > 0:
             self._idle_task = asyncio.create_task(self._close_when_idle())
 
@@ -285,7 +320,7 @@ class PlaywrightBackend:
         await asyncio.sleep(self._settings.browser_idle_seconds)
         async with self._lock:
             log.info("closing idle browser")
-            await self._shutdown()
+            await self._run_to_completion(self._stop)
 
 
 class FlareSolverrBackend:
@@ -429,6 +464,7 @@ class TrackerScraper:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._backends = self._build_backends(settings)
+        self._blocked_until: dict[str, float] = {}
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_scrapes)
         self._pacer = RequestPacer(
             settings.min_delay, settings.max_delay, settings.max_requests_per_hour
@@ -512,18 +548,54 @@ class TrackerScraper:
 
     async def _fetch(self, url: str) -> FetchResult:
         """Try each backend in order, moving on when one is blocked or unavailable."""
-        failure: TransientError | None = None
+        failures: list[tuple[str, TransientError]] = []
+        site_was_hit = False
         for backend in self._backends:
+            paused = self._blocked_until.get(backend.name, 0.0) - time.monotonic()
+            if paused > 0:
+                reason = (
+                    f"The {backend.name} backend is paused for another "
+                    f"{math.ceil(paused / 60)} min after a Cloudflare block."
+                )
+                failures.append((backend.name, CloudflareBlockedError(reason)))
+                continue
+            if site_was_hit:
+                # The blocked attempt already reached tracker.gg, so pace this one as well.
+                await self._pacer.wait()
             try:
                 result = await backend.fetch(url)
-            except (CloudflareBlockedError, BackendUnavailableError) as exc:
-                log.warning("%s backend failed: %s", backend.name, exc)
-                failure = failure or exc
-                continue
-            if parsers.is_cloudflare_challenge(result.body):
-                log.warning("%s backend returned a Cloudflare challenge", backend.name)
-                failure = failure or CloudflareBlockedError(_BLOCKED_HELP)
-                continue
-            log.debug("%s fetched %s (HTTP %s)", backend.name, url, result.status)
-            return result
-        raise failure or BackendUnavailableError("No scraping backend is configured.")
+                if parsers.is_cloudflare_challenge(result.body):
+                    raise CloudflareBlockedError("Cloudflare answered with a challenge page.")
+            except CloudflareBlockedError as exc:
+                # Leave the backend alone for a while rather than knock on every request.
+                self._blocked_until[backend.name] = time.monotonic() + _BLOCK_COOLDOWN
+                site_was_hit = True
+                failures.append((backend.name, exc))
+            except BackendUnavailableError as exc:
+                failures.append((backend.name, exc))
+            else:
+                log.debug("%s fetched %s (HTTP %s)", backend.name, url, result.status)
+                return result
+            log.warning("%s backend failed: %s", backend.name, failures[-1][1])
+        raise self._failure(failures)
+
+    def _failure(self, failures: list[tuple[str, TransientError]]) -> TransientError:
+        """One error for the caller that says what every backend ran into."""
+        if not failures:
+            return BackendUnavailableError("No scraping backend is configured.")
+        reasons = [(name, str(exc).rstrip(". ") + ".") for name, exc in failures]
+        if len(reasons) == 1:
+            detail = reasons[0][1]
+        else:
+            detail = " ".join(f"[{name}] {reason}" for name, reason in reasons)
+        if not any(isinstance(exc, CloudflareBlockedError) for _, exc in failures):
+            return BackendUnavailableError(detail)
+        advice = ["wait a few minutes"]
+        if self._settings.headless:
+            advice.append(
+                "set TRN_HEADLESS=false so a challenge can be solved in a visible browser "
+                "window (the clearance is remembered)"
+            )
+        if not self._settings.flaresolverr_url:
+            advice.append("set FLARESOLVERR_URL to use FlareSolverr as a fallback")
+        return CloudflareBlockedError(f"{detail} To get going again: {', or '.join(advice)}.")

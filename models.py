@@ -142,7 +142,8 @@ class MatchEntry(Model):
     kast: float | None = None
     damage: int | None = None
     combat_score: int | None = None
-    placement: int | None = None
+    # Position among all ten players by tracker.gg's performance score.
+    performance_rank: int | None = None
 
 
 class MatchPage(Model):
@@ -170,7 +171,7 @@ class MatchPlayer(Model):
     first_deaths: int | None = None
     plants: int | None = None
     defuses: int | None = None
-    placement: int | None = None
+    performance_rank: int | None = None
 
 
 class MatchTeam(Model):

@@ -17,6 +17,10 @@ _MATCH_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
 )
 _PLAYLIST_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_ACT_RE = re.compile(
+    r"(?:season|episode|ep|[ev])\s*(\d+)\D+?(?:act|a)\s*(\d+|[ivx]+)\b", re.IGNORECASE
+)
+_ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9}
 
 _PLAYLIST_ALIASES = {
     "ranked": "competitive",
@@ -87,6 +91,23 @@ def normalize_playlist(value: str | None) -> str:
             "deathmatch, team-deathmatch or premier."
         )
     return key
+
+
+def act_number(label: str | None) -> tuple[int, int] | None:
+    """Read (episode, act) from "E26: A6", "V26: ACT VI", "Season 26 Act 6" and the like."""
+    found = _ACT_RE.search(label or "")
+    if not found:
+        return None
+    act = found.group(2).casefold()
+    if not act.isdigit() and act not in _ROMAN:
+        return None
+    return int(found.group(1)), _ROMAN.get(act) or int(act)
+
+
+def act_label(label: str | None) -> str | None:
+    """Rewrite any spelling of an act the way profiles list it, for example "E26: A6"."""
+    number = act_number(label)
+    return f"E{number[0]}: A{number[1]}" if number else label
 
 
 def extract_match_id(value: str) -> str:

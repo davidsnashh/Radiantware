@@ -6,10 +6,13 @@ Personal use only. All data belongs to Tracker Network (tracker.gg).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
@@ -26,7 +29,6 @@ from cache import SQLiteCache
 from config import get_settings
 from models import MatchDetails, MatchEntry, MatchPage, MatchPlayer, PlayerProfile, StatsBundle
 from scraper import (
-    MatchNotFoundError,
     RiotId,
     TrackerError,
     TrackerScraper,
@@ -34,7 +36,7 @@ from scraper import (
     extract_match_id,
     normalize_playlist,
 )
-from scraper.utils import match_page_url, profile_page_url
+from scraper.utils import act_number, match_page_url, profile_page_url
 
 settings = get_settings()
 log = logging.getLogger("valorant_trn")
@@ -134,8 +136,9 @@ class Provenance:
         self._all_cached = True
         self.warnings: list[str] = []
 
-    def add(self, loaded: Loaded) -> None:
-        if self._oldest is None or loaded.fetched_at < self._oldest:
+    def add(self, loaded: Loaded, *, undated: bool = False) -> None:
+        """Record one piece. undated is for data that never changes, whose age says nothing."""
+        if not undated and (self._oldest is None or loaded.fetched_at < self._oldest):
             self._oldest = loaded.fetched_at
         self._all_cached = self._all_cached and loaded.cached
         if loaded.warning and loaded.warning not in self.warnings:
@@ -166,6 +169,13 @@ def tool_errors() -> Iterator[None]:
         raise ToolError(f"Unexpected error: {type(exc).__name__}: {exc}") from exc
 
 
+# One lock per thing being scraped, so overlapping tool calls scrape it once.
+# An entry disappears as soon as nobody holds or waits for its lock.
+_in_flight: weakref.WeakValueDictionary[tuple[str, str, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
 async def load(
     tool: str,
     riot_id: str,
@@ -174,28 +184,46 @@ async def load(
     fetch: Callable[[], Awaitable[Any]],
     *,
     force: bool = False,
+    not_before: float | None = None,
+    allow_stale: bool = True,
+    flight: str | None = None,
 ) -> Loaded:
     """Return the cached value, or scrape and store it.
 
-    When tracker.gg cannot be reached an expired entry is served instead, with
-    a warning, so a temporary block does not take the tools down.
+    Calls that need the same scrape wait for one another instead of repeating
+    it. flight names that scrape when one response fills several cache
+    entries. An entry stored before not_before counts as a miss. When
+    tracker.gg cannot be reached an expired entry is served instead, with a
+    warning, so a temporary block does not take the tools down.
     """
     key = {**params, "v": CACHE_VERSION}
-    if not force:
+
+    async def cached(newer_than: float | None) -> Loaded | None:
         hit = await cache.get(tool, riot_id, key)
-        if hit is not None:
-            return Loaded(hit.value, hit.created_at, cached=True)
-    try:
-        value = await fetch()
-    except TransientError as exc:
-        stale = await cache.get(tool, riot_id, key, allow_stale=True)
-        if stale is None:
-            raise
-        log.warning("serving stale %s data: %s", tool, exc)
-        warning = f"Tracker.gg could not be reached, showing data cached earlier. ({exc})"
-        return Loaded(stale.value, stale.created_at, cached=True, warning=warning)
-    await cache.set(tool, value, ttl, riot_id, key)
-    return Loaded(value, time.time(), cached=False)
+        if hit is None or (newer_than is not None and hit.created_at < newer_than):
+            return None
+        return Loaded(hit.value, hit.created_at, cached=True)
+
+    if not force and (found := await cached(not_before)):
+        return found
+    asked_at = time.time()
+    lock_key = (flight or tool, riot_id, json.dumps(key, sort_keys=True))
+    lock = _in_flight.get(lock_key) or _in_flight.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        # Whoever held the lock may just have scraped exactly this.
+        if found := await cached(asked_at if force else not_before):
+            return found
+        try:
+            value = await fetch()
+        except TransientError as exc:
+            stale = await cache.get(tool, riot_id, key, allow_stale=True) if allow_stale else None
+            if stale is None:
+                raise
+            log.warning("serving stale %s data: %s", tool, exc)
+            warning = f"Tracker.gg could not be reached, showing data cached earlier. ({exc})"
+            return Loaded(stale.value, stale.created_at, cached=True, warning=warning)
+        await cache.set(tool, value, ttl, riot_id, key)
+        return Loaded(value, time.time(), cached=False)
 
 
 def compact(data: dict[str, Any]) -> dict[str, Any]:
@@ -232,13 +260,14 @@ async def load_profile(rid: RiotId, origin: Provenance, *, force: bool = False) 
         profile = await tracker.fetch_profile(rid)
         # The profile response already holds the default act's stats and agents.
         # Store them so the other tools do not have to scrape for the same thing.
-        await store_sections(
-            rid,
-            profile.default_playlist,
-            profile.default_season,
-            profile.stats,
-            ("season_stats", "agents"),
-        )
+        if profile.default_season:
+            await store_sections(
+                rid,
+                profile.default_playlist,
+                profile.default_season,
+                profile.stats,
+                ("season_stats", "agents"),
+            )
         return profile.dump()
 
     loaded = await load("profile", rid.key, {}, settings.cache_ttl_overview, fetch, force=force)
@@ -265,7 +294,9 @@ async def load_section(
         return dump_section(bundle, section)
 
     ttl = section_ttl(section, season_id)
-    loaded = await load(section, rid.key, scope(playlist, season_id), ttl, fetch, force=force)
+    loaded = await load(
+        section, rid.key, scope(playlist, season_id), ttl, fetch, force=force, flight="stats"
+    )
     origin.add(loaded)
     return loaded.value
 
@@ -283,13 +314,18 @@ def resolve_season(profile: PlayerProfile, season: str) -> str | None:
         if profile.default_season:
             return profile.default_season
         return profile.seasons[0].id if profile.seasons else None
+    # Tracker.gg writes one act as "E26: A6", "V26: A6" or "V26: ACT VI" depending
+    # on the page, so compare the numbers as well as the spelling.
+    name, number = squash(wanted), act_number(wanted)
     for act in profile.seasons:
-        if wanted == act.id.casefold() or squash(wanted) in (
-            squash(act.name),
-            squash(act.short_name),
+        labels = (act.name, act.short_name)
+        if (
+            wanted == act.id.casefold()
+            or (name and name in map(squash, labels))
+            or (number and number in map(act_number, labels))
         ):
             return act.id
-    known = ", ".join(act.short_name or act.name or act.id for act in profile.seasons[:8])
+    known = ", ".join(act.short_name or act.name or act.id for act in profile.seasons)
     raise ToolError(f"Unknown season '{season}'. Use 'current', 'all' or one of: {known}.")
 
 
@@ -306,6 +342,7 @@ async def load_match_entries(
     """The player's most recent matches, newest first, without scoreboards."""
     entries: dict[str, MatchEntry] = {}
     page: int | None = 0
+    previous: float | None = None
     pages_left = limit // MATCHES_PER_PAGE + 2
     while page is not None and len(entries) < limit and pages_left > 0:
         pages_left -= 1
@@ -313,14 +350,29 @@ async def load_match_entries(
         async def fetch(page: int = page) -> dict[str, Any]:
             return (await tracker.fetch_match_page(rid, playlist, page)).dump()
 
-        params = {"playlist": playlist, "page": page}
-        loaded = await load(
-            "match_list", rid.key, params, settings.cache_ttl_matches, fetch, force=force
-        )
+        try:
+            # History pages shift whenever a new match is played, so a page is only
+            # used if it was stored no earlier than the one before it. Otherwise
+            # the matches that moved across the boundary would be skipped.
+            loaded = await load(
+                "match_list",
+                rid.key,
+                {"playlist": playlist, "page": page},
+                settings.cache_ttl_matches,
+                fetch,
+                force=force and page == 0,
+                not_before=previous,
+                allow_stale=page == 0,
+            )
+        except TransientError as exc:
+            if not entries:
+                raise
+            origin.warnings.append(
+                f"Only the {len(entries)} most recent matches could be listed: {exc}"
+            )
+            break
         origin.add(loaded)
-        # History pages shift whenever a new match is played. Once one page has
-        # been scraped the later ones must be too, or matches would be skipped.
-        force = force or not loaded.cached
+        previous = loaded.fetched_at
         result = MatchPage.model_validate(loaded.value)
         for entry in result.matches:
             entries.setdefault(entry.match_id, entry)
@@ -330,12 +382,11 @@ async def load_match_entries(
     return list(entries.values())[:limit]
 
 
-async def load_match(match_id: str) -> MatchDetails:
+async def load_match(match_id: str) -> Loaded:
     async def fetch() -> dict[str, Any]:
         return (await tracker.fetch_match(match_id)).dump()
 
-    loaded = await load("match", "", {"id": match_id}, settings.cache_ttl_match_details, fetch)
-    return MatchDetails.model_validate(loaded.value)
+    return await load("match", "", {"id": match_id}, settings.cache_ttl_match_details, fetch)
 
 
 async def load_scoreboards(
@@ -343,19 +394,26 @@ async def load_scoreboards(
 ) -> dict[str, MatchDetails]:
     """Scoreboards for the given matches, served from cache where possible."""
     boards: dict[str, MatchDetails] = {}
+    unavailable = 0
     for done, entry in enumerate(entries, 1):
         try:
-            boards[entry.match_id] = await load_match(entry.match_id)
-        except MatchNotFoundError:
-            pass
+            loaded = await load_match(entry.match_id)
         except TransientError as exc:
             # Do not keep knocking when tracker.gg is refusing requests.
             origin.warnings.append(
                 f"Scoreboards were loaded for {len(boards)} of {len(entries)} matches only: {exc}"
             )
             break
+        except TrackerError:
+            # Tracker.gg has no scoreboard for this match. The others are still worth having.
+            unavailable += 1
+        else:
+            origin.add(loaded, undated=True)
+            boards[entry.match_id] = MatchDetails.model_validate(loaded.value)
         with contextlib.suppress(Exception):
             await ctx.report_progress(done, len(entries), f"Loaded match {done}/{len(entries)}")
+    if unavailable:
+        origin.warnings.append(f"Tracker.gg has no scoreboard for {unavailable} of the matches.")
     return boards
 
 
@@ -550,7 +608,9 @@ async def get_recent_matches(
 
     Each match has match_id, url, played_at, map, mode, result (victory or
     defeat), score, agent, kills, deaths, assists, kd, acs, adr, hs_pct, kast,
-    damage, party_size and teammates. Every teammate entry has riot_id, agent,
+    damage, performance_rank (the player's position among all ten players by
+    tracker.gg's performance score), party_size and teammates. Every teammate
+    entry has riot_id, agent,
     rank, kills, deaths, assists, kd, acs, adr, hs_pct, kast and in_party
     (true when they queued together with the player). Group by teammate
     riot_id and filter by map to compare teammates, or call
@@ -590,11 +650,16 @@ async def get_match_details(
     with won, rounds_won, rounds_lost and players. Each player has riot_id,
     agent, rank, party_id (players sharing one queued together), kills,
     deaths, assists, kd, acs, adr, hs_pct, kast, damage, combat_score,
-    first_kills, first_deaths, plants, defuses and placement.
+    first_kills, first_deaths, plants, defuses and performance_rank (position
+    among all ten players by tracker.gg's performance score, which is not the
+    order by combat score).
     """
     with tool_errors():
         match_id = extract_match_id(match_id_or_url)
-        board = await load_match(match_id)
+        origin = Provenance()
+        loaded = await load_match(match_id)
+        origin.add(loaded)
+        board = MatchDetails.model_validate(loaded.value)
         result = board.dump()
         players = result.pop("players", [])
         result["url"] = match_page_url(match_id)
@@ -607,8 +672,7 @@ async def get_match_details(
                 ]
         else:
             result["players"] = players
-        result["source"] = "tracker.gg"
-        return result
+        return {**result, **origin.as_dict()}
 
 
 @mcp.tool(annotations=READ_ONLY)

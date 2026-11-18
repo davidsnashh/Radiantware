@@ -35,9 +35,10 @@ such as:
 | `get_teammate_stats(riot_id, map_name, limit_matches, playlist, top)` | Most played teammates, their stats, per-map breakdown, and your record with and without each |
 | `search_player(query)` | Riot IDs matching a name |
 
-Every tool returns a JSON object. Responses carry `source`, `cached`,
-`fetched_at` and, when something degraded, `warnings`. Percentages are on a
-0-100 scale. `season` accepts `current`, `all`, or an act such as `E26: A5`.
+Every tool returns a JSON object. Responses carry `source`, `cached` (false
+when anything had to be scraped for this answer), `fetched_at` and, when
+something degraded, `warnings`. Percentages are on a 0-100 scale. `season`
+accepts `current`, `all`, or an act such as `E26: A5`.
 
 ## Requirements
 
@@ -80,7 +81,9 @@ uv run server.py
 uv run server.py --transport streamable-http --port 8000
 ```
 
-### Claude Desktop
+### Connecting an MCP client
+
+Clients that are configured through an `mcpServers` JSON block take:
 
 ```json
 {
@@ -93,11 +96,8 @@ uv run server.py --transport streamable-http --port 8000
 }
 ```
 
-### Claude Code
-
-```bash
-claude mcp add valorant-trn-stats -- uv --directory /absolute/path/to/this/project run server.py
-```
+Clients that register servers on the command line take the same command:
+`uv --directory /absolute/path/to/this/project run server.py`.
 
 Run a single copy of the server. The browser profile can only be used by one
 process at a time, and one process is also what keeps the request pacing
@@ -116,9 +116,9 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `TRN_USER_AGENT` | | Override the user agent. Leave empty |
 | `TRN_BROWSER_IDLE_SECONDS` | `120` | Close the browser after this long without requests. `0` keeps it open |
 | `TRN_MIN_DELAY` / `TRN_MAX_DELAY` | `1.5` / `4.0` | Random pause between requests, in seconds |
-| `TRN_MAX_CONCURRENT_SCRAPES` | `1` | Requests in flight at once |
-| `TRN_MAX_REQUESTS_PER_HOUR` | `240` | Hard hourly cap. `0` disables it |
-| `TRN_MAX_RETRIES` | `2` | Retries for transient failures, with exponential backoff |
+| `TRN_MAX_CONCURRENT_SCRAPES` | `1` | Requests in flight at once, `1` or `2`. Keep it at `1` |
+| `TRN_MAX_REQUESTS_PER_HOUR` | `240` | Hourly request cap of one server process. `0` disables it |
+| `TRN_MAX_RETRIES` | `2` | Retries for transient failures, `0` to `3`, with exponential backoff |
 | `TRN_BACKOFF_BASE` | `2.0` | First backoff delay, in seconds |
 | `TRN_REQUEST_TIMEOUT` | `30` | Seconds to wait for one response |
 | `TRN_CHALLENGE_TIMEOUT` | `30` | Seconds to wait for a Cloudflare challenge to clear |
@@ -190,10 +190,13 @@ If a challenge appears anyway, the server loads a normal tracker.gg page and
 waits up to `TRN_CHALLENGE_TIMEOUT` for it to clear. If it does not:
 
 1. FlareSolverr is tried when `FLARESOLVERR_URL` is set.
-2. Otherwise the tool fails with a message that says so. It does not retry a
-   block. Setting `TRN_HEADLESS=false` shows the browser, which passes more
-   easily and lets you solve a challenge by hand. The clearance is stored in
-   the profile under `TRN_DATA_DIR`.
+2. Otherwise the tool fails with a message that says what happened.
+
+A block is never retried. The blocked backend is left alone for five minutes,
+during which calls fail fast (or go straight to the fallback) instead of
+knocking again. Setting `TRN_HEADLESS=false` shows the browser, which passes
+more easily and lets you solve a challenge by hand. The clearance is stored in
+the profile under `TRN_DATA_DIR`.
 
 ### FlareSolverr (optional)
 
@@ -215,10 +218,15 @@ The scraper is slow on purpose:
 
 - one request at a time
 - a random 1.5 to 4 second pause after every request
-- at most 240 requests per hour
+- at most 240 requests per hour, counted per server process
 - two retries with exponential backoff for timeouts and server errors, a
   longer wait after a rate-limit response, and no retry at all after a
   Cloudflare block
+- tool calls that overlap share one scrape instead of each making their own
+
+With `TRN_MAX_CONCURRENT_SCRAPES=2` the pause is measured between the starts
+of two requests rather than after each one finishes. The browser handles one
+request at a time either way, so there is nothing to gain from it.
 
 Approximate cost of a call on a cold cache:
 
@@ -226,7 +234,7 @@ Approximate cost of a call on a cold cache:
 | --- | --- |
 | `get_player_overview` | 1, plus 1 for career totals |
 | `get_player_agents` | 0 after an overview, otherwise 1 to 2 |
-| `get_player_maps` | 1 |
+| `get_player_maps` | 1 after an overview, otherwise 2 |
 | `get_recent_matches`, `get_teammate_stats` | 1 per 20 matches, plus 1 per match not seen before |
 | `get_match_details`, `search_player` | 1 |
 
@@ -258,6 +266,7 @@ players, so teammate analysis covers them.
 
 - Rank rating (RR) is only available for Immortal and Radiant players.
   Tracker.gg does not have it for lower ranks.
+- MVP counts exist per act only, so all-act results leave them out.
 - "Current" means the act tracker.gg shows by default for that player.
 - Private-profile handling could not be exercised against a real private
   profile, since none turned up during testing.
