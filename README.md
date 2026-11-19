@@ -32,12 +32,26 @@ only been tested on macOS.
    Without git, choose **Code**, then **Download ZIP** on the GitHub page,
    unzip it and open a terminal in the unzipped folder.
 
-4. Pack the server into one file:
+4. Pack the server into one file. Claude Desktop installs an extension from a
+   single `.mcpb` file, which is a zip of the server's code plus
+   `manifest.json`, the file that tells Claude Desktop how to start it. Make
+   that file by running these two lines in the project folder:
 
    ```bash
    rm -f valorant-trn-stats.mcpb
    zip -rXD valorant-trn-stats.mcpb manifest.json pyproject.toml uv.lock README.md *.py cache scraper -x '*/__pycache__/*' '*.DS_Store'
    ```
+
+   - The first line deletes an older `valorant-trn-stats.mcpb`, so that
+     nothing stale stays in it. The first time there is nothing to delete.
+   - The second line zips what the server needs: the manifest, the two files
+     that list its Python packages, the code and this README. `cache` and
+     `scraper` are code folders. Your settings (`.env`), the downloaded data
+     (`.data`) and the tests are left out.
+   - The part after `-x` skips leftover files that Python and macOS create.
+
+   It prints one "adding" line per file. When it is done,
+   `valorant-trn-stats.mcpb` is in the project folder.
 
 5. Double-click `valorant-trn-stats.mcpb`, or run `open valorant-trn-stats.mcpb`.
    Claude Desktop shows an install screen. Click **Install** and give it a
