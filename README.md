@@ -1,19 +1,15 @@
 # valorant-trn-mcp
 
-An MCP server that gives an LLM structured Valorant statistics, scraped from
+An MCP server that gives LLM reasoning access to structured Valorant statistics, scraped from
 [tracker.gg](https://tracker.gg/valorant).
 
-> **Personal use only. Not for sale.**
-> This project must never be sold, marketed, published or offered as a public
-> service, and it must never be presented as an original data source. All
-> statistics belong to **Tracker Network (TRN)**, who get full credit for them.
-> It exists under a personal-use permission from Tracker Network's owner. If
-> you do not have that permission yourself, do not run it.
+
+>All statistics belong to **Tracker Network (TRN)**, who get full credit for them.
 
 ## Quick start
 
 The easiest way to use it is as an extension in Claude Desktop. You need
-Claude Desktop and Google Chrome.
+Claude Desktop and Google Chrome or Safari.
 
 1. Pack the server into one file. Run this in the project folder, and again
    after any code change:
