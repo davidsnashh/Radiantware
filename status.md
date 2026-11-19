@@ -1,10 +1,10 @@
 # Status
 
-Last updated: 18 November 2026
+Last updated: 19 November 2026
 
 ## Summary
 
-The server is built and working. All 18 tools were run against the live tracker.gg site and returned real data. The newest changes are in the project folder but were not committed yet when this file was written.
+The server is built and working. All 18 tools were run against the live tracker.gg site and returned real data. It can also be packed into one file that installs in Claude Desktop. The files for that are new and were not committed yet when this file was written.
 
 ## What this is
 
@@ -42,6 +42,7 @@ Behind the tools:
 - Slow and polite requests. One at a time, a random wait of 1.5 to 4 seconds between them, at most 240 per hour, and at most 2 retries when a request fails.
 - Two ways to connect: stdio and streamable HTTP.
 - Settings in a `.env` file. Every setting has a default.
+- A Claude Desktop bundle. `manifest.json` describes it, and one zip command packs it into `valorant-trn-stats.mcpb`.
 - A README with setup steps, examples and the personal use warning.
 
 The tools give an assistant what it needs for questions like "Which of my 5 most played teammates has the lowest KD on Split?" or "What is my win rate with X compared to without X?"
@@ -58,9 +59,12 @@ The tools give an assistant what it needs for questions like "Which of my 5 most
 - The extra stats were checked against tracker.gg's own totals on 5 saved matches and 8 live ones. A second review of that work found about 15 more problems, which were also fixed.
 - The round-by-round data was checked the same way on 7 saved matches and on live ones. A third review found 6 more problems, which were also fixed.
 - The last batch (teammate totals, daily stats, stat history, rank distribution, leaderboard, insights, Premier, filters) was run live and reviewed. That review found 11 problems, which were fixed. Part of it could not finish its checks of Premier and the reference lists.
+- The Claude Desktop bundle was unpacked and started the way Claude Desktop starts it, with uv 0.12 and Python 3.12. Eight tools were run live from that copy without errors.
+- The bundle was installed in Claude Desktop on 19 November 2026. Claude Desktop's log shows that it installed, connected and found all 18 tools, and two requests made from Claude Desktop came back without errors.
 
 ## What was not tested
 
+- Claude Desktop's own copy of uv (0.9.7). It only downloads that when no uv is installed. Here it used the uv that was already on this machine.
 - A real private profile. The code returns a clear error for one, but none came up during testing.
 - A real Cloudflare block. What the server does after a block was only tested with fake blocks.
 - Console playlists.
@@ -77,6 +81,8 @@ There are no automated tests in the repo. Testing used throwaway scripts with re
 - Kill positions are map coordinates. Tracker.gg does not name the place, so nothing says "A Main". Only spike plants have a site.
 - It is slow on purpose. Loading 20 new matches takes about a minute the first time. After that they come from the cache.
 - Only one copy of the server should run at a time.
+- The Claude Desktop bundle is a copy of the code. After a change, pack and install it again.
+- Claude Desktop starts two copies of the server. They share one browser profile, and only one copy can use the browser at a time. If both were asked at the same moment, the second would fail until the first closes its browser, which takes two minutes. This has not happened so far.
 - If tracker.gg changes its site, the scraper can break. The fixes would go in `scraper/parsers.py`.
 - Cloudflare could start blocking it at any time. If that happens, wait five minutes, or set `TRN_HEADLESS=false`, or set up FlareSolverr.
 
@@ -89,7 +95,7 @@ There are no automated tests in the repo. Testing used throwaway scripts with re
 - Docker, only if you want FlareSolverr
 - Permission from the owner of Tracker Network to scrape for personal use
 
-On this machine, `.env` points at a Chrome app named "Google Chrome 2". If that app is moved or renamed, change `TRN_BROWSER_EXECUTABLE` in `.env`.
+On this machine, `.env` points at a Chrome app named "Google Chrome 2". If that app is moved or renamed, change `TRN_BROWSER_EXECUTABLE` in `.env`. The bundle uses the same path as the default of its Chrome path setting. That one is changed in Claude Desktop, in the extension's settings.
 
 ## How to run it
 
@@ -97,13 +103,13 @@ On this machine, `.env` points at a Chrome app named "Google Chrome 2". If that 
 - Try the tools by hand: `uv run mcp dev server.py`
 - Run it for an MCP client: `uv run server.py`
 - Run it over HTTP: `uv run server.py --transport streamable-http --port 8000`
+- Use it in Claude Desktop: follow Quick start at the top of the README. It is installed on this machine already, so opening Claude Desktop is enough.
 
 The README has the full setup steps and every setting.
 
 ## What is next
 
-- Commit the newest fixes, together with this file.
-- Add the server to your MCP client and try it on your own account.
+- Commit the bundle files, together with this file.
 - Add automated tests that use made-up sample data.
 - Try a private profile and a console playlist when the chance comes up.
 - Check from time to time that tracker.gg has not changed its site.

@@ -1,0 +1,38 @@
+{
+  "manifest_version": "0.4",
+  "name": "valorant-trn-stats",
+  "display_name": "Valorant Stats (tracker.gg)",
+  "version": "0.1.0",
+  "description": "Personal-use Valorant stats scraped from tracker.gg. All data and credit belong to Tracker Network.",
+  "long_description": "Looks up Valorant stats on tracker.gg: profile, agents, maps, weapons, matches round by round, teammates, rank history and more.\n\nFor personal, private use only. Do not share, publish or sell this bundle. All data comes from Tracker Network (tracker.gg), which gets the credit for it.\n\nRequests are slow on purpose: one at a time with a pause between them, and results are cached.",
+  "author": {
+    "name": "David"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--frozen", "--directory", "${__dirname}", "server.py"],
+      "env": {
+        "TRN_DATA_DIR": "${HOME}/.valorant-trn-mcp",
+        "TRN_BROWSER_EXECUTABLE": "${user_config.browser_executable}",
+        "TRN_HEADLESS": "${user_config.headless}"
+      }
+    }
+  },
+  "user_config": {
+    "browser_executable": {
+      "type": "string",
+      "title": "Chrome path",
+      "description": "Full path to the Google Chrome program. Leave empty when Chrome is installed in the usual place.",
+      "default": "/Applications/Google Chrome 2.app/Contents/MacOS/Google Chrome"
+    },
+    "headless": {
+      "type": "boolean",
+      "title": "Hide the browser window",
+      "description": "Turn this off if Cloudflare starts blocking requests. A visible browser passes more easily.",
+      "default": true
+    }
+  }
+}

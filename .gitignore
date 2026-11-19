@@ -12,5 +12,8 @@ __pycache__/
 # Runtime data: SQLite cache and the persistent browser profile
 .data/
 
+# Claude Desktop bundle, built with "mcpb pack"
+*.mcpb
+
 # macOS
 .DS_Store

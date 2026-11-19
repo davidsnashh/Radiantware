@@ -10,6 +10,29 @@ An MCP server that gives an LLM structured Valorant statistics, scraped from
 > It exists under a personal-use permission from Tracker Network's owner. If
 > you do not have that permission yourself, do not run it.
 
+## Quick start
+
+The easiest way to use it is as an extension in Claude Desktop. You need
+Claude Desktop and Google Chrome.
+
+1. Pack the server into one file. Run this in the project folder, and again
+   after any code change:
+
+   ```bash
+   rm -f valorant-trn-stats.mcpb
+   zip -rXD valorant-trn-stats.mcpb manifest.json pyproject.toml uv.lock README.md *.py cache scraper -x '*/__pycache__/*' '*.DS_Store'
+   ```
+
+2. Double-click `valorant-trn-stats.mcpb`, or run `open valorant-trn-stats.mcpb`.
+3. Click **Install** in Claude Desktop and give it a minute or two to fetch
+   the dependencies.
+4. Start a new chat and ask, for example: "My Riot ID is Name#TAG. What's my
+   rank and K/D this act?"
+
+It stays installed, so from then on just open Claude Desktop and ask. Details
+are under [Claude Desktop bundle](#claude-desktop-bundle). Other clients are
+under [Connecting an MCP client](#connecting-an-mcp-client).
+
 ## What it does
 
 Tracker.gg has no public Valorant API, and Riot's official API is not usable
@@ -230,6 +253,30 @@ Run a single copy of the server. The browser profile can only be used by one
 process at a time, and one process is also what keeps the request pacing
 honest. To share it between several clients, start it once with
 `--transport streamable-http` and point them all at that URL.
+
+### Claude Desktop bundle
+
+`manifest.json` describes the server as a Claude Desktop extension.
+[Quick start](#quick-start) has the command that packs it into one file and
+the steps to install it.
+
+Claude Desktop installs the dependencies itself with uv, so the file holds
+only the source. It is a copy: after changing the code, pack and install it
+again.
+
+- Settings do not come from `.env`. The Chrome path and whether the browser
+  window is hidden are set in the extension's settings in Claude Desktop. The
+  default Chrome path in `manifest.json` is the one for this machine.
+- Data goes to `~/.valorant-trn-mcp` instead of `.data`, so it survives
+  installing a newer bundle.
+- Claude Desktop starts two copies of the server, and they share that folder.
+  Only one copy can use the browser at a time. If both are asked at the same
+  moment, the second fails until the first closes its browser, which takes
+  two minutes.
+- The official packer, `npx @anthropic-ai/mcpb pack . valorant-trn-stats.mcpb`,
+  can be used instead. `.mcpbignore` keeps local data and the virtual
+  environment out of its output.
+- The bundle is for your own machine. Do not share it.
 
 ## Configuration
 
@@ -479,6 +526,7 @@ server.py              MCP server and tools
 analysis.py            Teammate aggregation
 models.py              Pydantic models for scraped data
 config.py              Settings (environment / .env)
+manifest.json          Claude Desktop bundle description
 scraper/
   trn.py               Browser session, FlareSolverr client, pacing, retries
   parsers.py           Tracker.gg JSON (or HTML-wrapped JSON) to models

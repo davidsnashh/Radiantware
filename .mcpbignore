@@ -1,0 +1,11 @@
+# Left out of the Claude Desktop bundle. The packer already skips .git, .env* and *.mcpb.
+.venv/
+.data/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+requirements.txt
+status.md
