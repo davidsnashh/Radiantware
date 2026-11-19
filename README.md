@@ -26,6 +26,9 @@ such as:
 - "Am I better on attack or defense on Lotus, and on which buy rounds?"
 - "How often do we win a round after getting the first kill, and how often do we retake a site?"
 - "Walk me through round 12 of my last match."
+- "Who have I played with the most in the last few months, and do I do better solo or in a five-stack?"
+- "Is my K/D going up or down this month, and what was my best game ever?"
+- "What share of players is my rank in the top of?"
 - "Which agent should I pick on Bind this act?"
 
 ## Tools
@@ -36,17 +39,26 @@ such as:
 | `get_player_agents(riot_id, playlist, season, agents, detailed, force_refresh)` | Per-agent stats with each agent's most played maps, plus totals per role |
 | `get_player_maps(riot_id, playlist, season, maps, detailed, force_refresh)` | Per-map stats with attack/defense numbers and top agents |
 | `get_player_weapons(riot_id, playlist, season, force_refresh)` | Per-weapon kills, deaths, headshot rate, damage and kill distance |
-| `get_recent_matches(riot_id, limit, playlist, include_opponents, detailed, skip, force_refresh)` | Match history with the player's line and every teammate's line |
+| `get_recent_matches(riot_id, limit, playlist, include_opponents, detailed, skip, map_name, agent, season, force_refresh)` | Match history with the player's line and every teammate's line |
 | `get_match_details(match_id_or_url, detailed)` | Full scoreboard: both teams, all ten players |
 | `get_match_rounds(match_id_or_url, rounds, riot_id, detailed)` | One match round by round: result, economy, plant and defuse, and every kill in order |
-| `get_round_stats(riot_id, map_name, limit_matches, playlist)` | How rounds go for the player's team over recent matches: by side, after a plant, on pistol rounds, after the first kill, by buy |
-| `get_teammate_stats(riot_id, map_name, limit_matches, playlist, top, detailed)` | Most played teammates, their stats, per-map breakdown, and your record with and without each |
+| `get_round_stats(riot_id, map_name, agent, limit_matches, playlist)` | How rounds go for the player's team over recent matches: by side, after a plant, on pistol rounds, after the first kill, by buy |
+| `get_teammate_stats(riot_id, map_name, agent, limit_matches, playlist, top, detailed)` | Teammates in the matches analysed, their stats, per-map breakdown, and your record with and without each |
+| `get_top_teammates(riot_id, playlist)` | Tracker.gg's own list of the most played teammates over the last months, and the player's record by party size |
+| `get_daily_stats(riot_id, playlist, days)` | Day-by-day matches, wins, K/D, ADR and placement |
+| `get_stat_history(riot_id, stat, playlist)` | One stat day by day for about a month, and the ten best matches for it |
+| `get_rank_distribution(region, season)` | Share of ranked players per rank, and which top percent each rank is |
+| `get_leaderboard(region, season, start_rank, limit)` | The ranked leaderboard of a region |
+| `get_meta_insights()` | Agent tier list, pick and win rates, and map numbers across all tracked matches |
+| `get_premier_team(riot_id, roster_id, detailed)` | A Premier team: standing, players, stages and recent matches |
+| `get_game_data(kind)` | Reference lists: agents, maps, weapons, acts, playlists |
 | `search_player(query)` | Riot IDs matching a name |
 
 Every tool returns a JSON object. Responses carry `source`, `cached` (false
 when anything had to be scraped for this answer), `fetched_at` and, when
 something degraded, `warnings`. Percentages are on a 0-100 scale. `season`
-accepts `current`, `all`, or an act such as `E26: A5`.
+accepts `current`, `all`, or an act such as `E26: A5`. The rank distribution
+and the leaderboard are per act, so they take `current` or an act, not `all`.
 
 ### Headline numbers and the full sheet
 
@@ -58,9 +70,9 @@ answer. Fields tracker.gg has no value for are left out.
 | Tool | `detailed=true` adds |
 | --- | --- |
 | `get_player_overview`, `get_player_agents`, `get_player_maps` | The whole stat sheet: attack and defense blocks, clutches won and lost by size, multi-kills, trades, rounds survived, last deaths, entry success, plants, defuses, econ rating, ability casts, shots dealt and received by body part, flawless and thrifty rounds. Agents also get the name and casts of each ability, and every top map or top agent gets its K/D, ACS, ADR, HS% and KAST |
-| `get_match_details` | Per player: attack and defense blocks, their rounds by buy type, kills per weapon. For the match: a log of every round |
+| `get_match_details` | Per player: attack and defense blocks, their rounds by buy type, kills per weapon, duels against each opponent and the parts of the performance score. For the match: a log of every round |
 | `get_recent_matches` | The whole scoreboard line for the player and every teammate, for at most eight matches per call |
-| `get_match_rounds` | Per kill: the assists, the distance and where both players stood on the minimap. Per round: the line of all ten players |
+| `get_match_rounds` | Per kill: the assists, the distance, whether it was alternate fire and where both players stood on the minimap. Per plant and defuse: where it happened. Per round: the line of all ten players |
 | `get_teammate_stats` | Per teammate: attack and defense blocks, rounds by buy type, kills per weapon, tracker.gg's match labels |
 
 `get_match_details` and `get_teammate_stats` already include clutches,
@@ -72,6 +84,35 @@ MCP clients reject or cut off very long answers, so a list that would run
 past roughly 18,000 tokens is shortened and a `note` in the answer says so.
 For the match history the note gives the `skip` value that continues where
 the answer stopped.
+
+### Tracker.gg's own totals
+
+Besides profiles and scoreboards, tracker.gg keeps totals of its own, and a
+few tools read those directly. Each costs one request.
+
+- `get_top_teammates`: the up to twenty most played teammates over tracker.gg's
+  recent window (a few months, the answer says which days), with the record
+  together and the teammate's own K/D and average placement in those matches,
+  plus the player's record by party size. This covers hundreds of matches,
+  where `get_teammate_stats` reads scoreboards one at a time but knows every
+  stat. `get_teammate_stats` marks each teammate with `most_played_rank`,
+  their place on this list.
+- `get_daily_stats`: one line per day played.
+- `get_stat_history`: one stat day by day for about the last month, and the
+  ten best matches for it from any act, each with the value it reached.
+  `stat="rank"` gives the rank history over about three months, which
+  tracker.gg only keeps for Immortal and Radiant players. Its days are UTC
+  days, while `get_daily_stats` goes by this computer's time zone, so the two
+  can put an evening match on different dates.
+
+`map_name`, `agent` and (for the history) `season` filter on tracker.gg's
+side. So `get_teammate_stats(map_name="Split", limit_matches=30)` analyses the
+last thirty matches on Split, not the Split matches among the last thirty.
+
+The rest is not about one player: `get_rank_distribution` and
+`get_leaderboard` per region and act, `get_meta_insights` for agents and maps
+across all tracked matches, `get_premier_team` for a Premier roster, and
+`get_game_data` for the reference lists.
 
 ### Round by round
 
@@ -117,6 +158,9 @@ The same names are used in every tool.
 | `ability_casts` | Ability uses by slot: `c`, `q`, `e` and `x` |
 | `tracker_score` | Tracker.gg's rating out of 1000 |
 | `performance_score`, `performance_rank` | Tracker.gg's performance number for a match and the position among the ten players by it |
+| `performance_grade`, `performance_parts` | Tracker.gg's grade for that number (pass, merit or distinction) and the parts it is made of |
+| `avg_placement` | The average `performance_rank` over a set of matches, 1 being best |
+| `duels` | Per opponent in a match: kills, deaths and damage both ways |
 | `attack`, `defense` | The player's numbers on one side |
 | `buys`, `buy` | The player's rounds by tracker.gg's buy type. `pistol` is the first round of a half. Otherwise it goes by credits spent in the round: `eco` up to 1000, `semi` up to 3850, `full` from 3900 |
 | `killer_at`, `victim_at` | Minimap positions as `[x, y]`, each from 0 at the top left to 1 |
@@ -205,11 +249,11 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `TRN_BACKOFF_BASE` | `2.0` | First backoff delay, in seconds |
 | `TRN_REQUEST_TIMEOUT` | `30` | Seconds to wait for one response |
 | `TRN_CHALLENGE_TIMEOUT` | `30` | Seconds to wait for a Cloudflare challenge to clear |
-| `TRN_CACHE_TTL_OVERVIEW` | `2700` | Profile and overview stats |
+| `TRN_CACHE_TTL_OVERVIEW` | `2700` | Profile and overview stats, stat history, Premier teams |
 | `TRN_CACHE_TTL_AGENTS` / `TRN_CACHE_TTL_MAPS` | `5400` | Agent, role and weapon tables / map table |
-| `TRN_CACHE_TTL_MATCHES` | `1200` | Match history list |
-| `TRN_CACHE_TTL_CAREER` | `21600` | All-act totals |
-| `TRN_CACHE_TTL_SEARCH` | `3600` | Search results |
+| `TRN_CACHE_TTL_MATCHES` | `1200` | Match history list, top teammates and daily stats |
+| `TRN_CACHE_TTL_CAREER` | `21600` | All-act totals, rank distribution, insights |
+| `TRN_CACHE_TTL_SEARCH` | `3600` | Search results, leaderboards |
 | `TRN_CACHE_TTL_MATCH_DETAILS` | `2592000` | Scoreboards (finished matches never change) |
 | `FLARESOLVERR_URL` | | FlareSolverr endpoint, used as a fallback |
 | `TRN_BACKEND` | `playwright` | Set to `flaresolverr` to make it the primary |
@@ -254,6 +298,18 @@ Copy `.env.example` to `.env`. Everything is optional.
 // Round patterns over the last 40 matches on Split
 {"tool": "get_round_stats", "arguments": {"riot_id": "Player#NA1", "map_name": "Split", "limit_matches": 40}}
 
+// The most played teammates of the last months, and the record by party size
+{"tool": "get_top_teammates", "arguments": {"riot_id": "Player#NA1"}}
+
+// Headshot rate day by day, and the ten best matches for it
+{"tool": "get_stat_history", "arguments": {"riot_id": "Player#NA1", "stat": "hs_pct"}}
+
+// The last ten matches on Jett on Ascent
+{"tool": "get_recent_matches", "arguments": {"riot_id": "Player#NA1", "limit": 10, "agent": "Jett", "map_name": "Ascent"}}
+
+// Which top percent each rank is in Europe
+{"tool": "get_rank_distribution", "arguments": {"region": "eu"}}
+
 // Find a tagline
 {"tool": "search_player", "arguments": {"query": "Player"}}
 ```
@@ -261,10 +317,10 @@ Copy `.env.example` to `.env`. Everything is optional.
 Riot IDs are accepted as `Name#TAG`, with stray spaces, URL-encoded
 (`Name%23TAG`), or as a full tracker.gg profile URL.
 
-For the Split question above, `get_teammate_stats` ranks teammates by games
-played together across all analysed matches (`rank`), and with `map_name` adds
-an `on_map` block to each. The answer is the lowest `on_map.kd` among ranks 1
-to 5.
+For the Split question above, `get_teammate_stats` with `map_name="Split"`
+analyses the most recent matches on Split, and every teammate in them carries
+`most_played_rank`, their place among the player's most played teammates of
+the last months. The answer is the lowest `kd` among those ranked 1 to 5.
 
 For "who dies first the most", compare `first_death_rate`: the percentage of
 rounds played together in which that teammate was the first of all ten players
@@ -342,8 +398,14 @@ Approximate cost of a call on a cold cache:
 | `get_player_overview` | 1, plus 1 for career totals |
 | `get_player_agents` | 0 after an overview, otherwise 1 to 2 |
 | `get_player_maps`, `get_player_weapons` | 1 after an overview, otherwise 2. The second of the two is free |
-| `get_recent_matches`, `get_teammate_stats`, `get_round_stats` | 1 per 20 matches, plus 1 per match not seen before |
+| `get_recent_matches`, `get_round_stats` | 1 per 20 matches, plus 1 per match not seen before |
+| `get_teammate_stats` | The same, plus 1 for the most-played list it shares with `get_top_teammates` |
 | `get_match_details`, `get_match_rounds`, `search_player` | 1 |
+| `get_top_teammates`, `get_daily_stats` | 1 for the two together |
+| `get_stat_history`, `get_leaderboard`, `get_rank_distribution` | 1 |
+| `get_meta_insights` | 2 |
+| `get_premier_team` | 1, plus 1 to look the team up from a player |
+| `get_game_data`, and the first use of a map, agent or act filter | 1, then nothing for a week. They are fetched again sooner when the act ends or a name is not on them |
 
 Scoreboards dominate. Twenty new matches take roughly a minute, after which
 they are served from the cache for 30 days. If your MCP client gives up on a
@@ -385,6 +447,15 @@ players, so teammate analysis covers them.
 - The spending limits behind the buy types are not published. The ones used
   here reproduce tracker.gg's own counts on every match tested.
 - Modes without rounds, such as deathmatch, have no round data.
+- Tracker.gg's own totals reach back a few months, not to the start of an act,
+  and list at most twenty teammates. They cannot be narrowed to an act or a map.
+- `get_meta_insights` is one set of numbers for everyone. Tracker.gg's rank and
+  map filters for it did not respond to anything tried.
+- Rank history exists for Immortal and Radiant players only.
+- Premier schedules and Premier leaderboards did not answer without more
+  parameters than could be found, so only teams are covered.
+- Personal details tracker.gg shows next to stats (country, linked social
+  accounts, site membership) are left out on purpose.
 - A stored match takes about 80 KB in the cache with its rounds.
 - MVPs, trade kills, thrifty rounds, the tracker score and damage taken per
   weapon exist per act only, so all-act results leave them out.

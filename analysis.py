@@ -314,33 +314,27 @@ class _Teammate:
     player_with: _Tally = field(default_factory=_Tally)
 
 
-def _same_map(a: str | None, b: str | None) -> bool:
-    return bool(a) and bool(b) and a.strip().casefold() == b.strip().casefold()
-
-
 def teammate_stats(
     riot_id: str,
     matches: Sequence[MatchDetails],
-    map_name: str | None = None,
     top: int = 10,
     entries: Mapping[str, MatchEntry] | None = None,
     detailed: bool = False,
+    most_played: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Aggregate the players who shared a team with riot_id across the given matches.
 
-    Teammates are ranked by games played together over all matches. With
-    map_name only teammates seen on that map are listed, each with an extra
-    "on_map" block, while "rank" still reflects the overall ordering. entries
+    Teammates are ranked by games played together in those matches. entries
     maps match IDs to the player's history rows, see find_player. detailed
     adds each player's numbers per side and per kind of buy, their kills per
-    weapon and tracker.gg's match labels.
+    weapon and tracker.gg's match labels. most_played is tracker.gg's own
+    list of the player's most played teammates, most played first: a
+    teammate on it gets that position as most_played_rank.
     """
     player = _Record()
-    player_on_map = _Tally()
     teammates: dict[str, _Teammate] = {}
     # (teammate keys, the player's row, rounds, result) per analysed match.
     appearances: list[tuple[set[str], MatchPlayer, int | None, bool | None]] = []
-    map_label = map_name
 
     for match in matches:
         me = find_player(match, riot_id, (entries or {}).get(match.match_id))
@@ -348,9 +342,6 @@ def teammate_stats(
             continue
         won = team_won(match, me.team)
         player.add(me, match.rounds, won)
-        if _same_map(match.map, map_name):
-            player_on_map.add(me, match.rounds, won)
-            map_label = match.map
 
         present: set[str] = set()
         for row in match.players:
@@ -378,47 +369,38 @@ def teammate_stats(
         key=lambda item: (games(item[1]), item[1].party_games, item[1].record.overall.wins),
         reverse=True,
     )
+    standing = {name.casefold(): place for place, name in enumerate(most_played or [], 1)}
 
     rows: list[dict[str, Any]] = []
-    for rank, (key, mate) in enumerate(ranked, 1):
-        on_map = next((t for name, t in mate.by_map.items() if _same_map(name, map_name)), None)
-        if map_name and on_map is None:
-            continue
-        if len(rows) >= top:
-            break
+    for rank, (key, mate) in enumerate(ranked[:top], 1):
         without = _Tally()
         for present, me, rounds, won in appearances:
             if key not in present:
                 without.add(me, rounds, won)
-        row: dict[str, Any] = _known(
-            {
-                "riot_id": mate.riot_id,
-                "rank": rank,
-                "account_level": mate.account_level,
-                "games_together": games(mate),
-                "games_in_party": mate.party_games,
-                **{k: v for k, v in mate.record.view(detailed).items() if k != "games"},
-                "agents": dict(mate.agents.most_common()),
-                "by_map": {name: tally.brief() for name, tally in sorted(mate.by_map.items())},
-                "your_record_with": mate.player_with.brief(),
-                "your_record_without": without.brief(),
-            }
+        rows.append(
+            _known(
+                {
+                    "riot_id": mate.riot_id,
+                    "rank": rank,
+                    "most_played_rank": standing.get(key),
+                    "account_level": mate.account_level,
+                    "games_together": games(mate),
+                    "games_in_party": mate.party_games,
+                    **{k: v for k, v in mate.record.view(detailed).items() if k != "games"},
+                    "agents": dict(mate.agents.most_common()),
+                    "by_map": {name: tally.brief() for name, tally in sorted(mate.by_map.items())},
+                    "your_record_with": mate.player_with.brief(),
+                    "your_record_without": without.brief(),
+                }
+            )
         )
-        if on_map is not None:
-            row["on_map"] = on_map.summary()
-        rows.append(row)
 
-    result: dict[str, Any] = {
+    return {
         "matches_analyzed": player.overall.games,
         "your_stats": player.view(detailed),
         "teammates_seen": len(teammates),
         "teammates": rows,
     }
-    if map_name:
-        result["map_filter"] = map_label
-        result["matches_on_map"] = player_on_map.games
-        result["your_stats_on_map"] = player_on_map.summary()
-    return result
 
 
 def team_buy(lines: Sequence[RoundPlayer]) -> str | None:
@@ -448,7 +430,6 @@ class _Rounds:
 def round_stats(
     riot_id: str,
     matches: Sequence[MatchDetails],
-    map_name: str | None = None,
     entries: Mapping[str, MatchEntry] | None = None,
 ) -> dict[str, Any]:
     """How the rounds of the given matches went for riot_id's team.
@@ -471,11 +452,8 @@ def round_stats(
     kill_time, death_time, kill_range, death_range = _Mean(), _Mean(), _Mean(), _Mean()
     killed_by: Counter[str] = Counter()
     analysed = without_rounds = 0
-    map_label = map_name
 
     for match in matches:
-        if map_name and not _same_map(match.map, map_name):
-            continue
         me = find_player(match, riot_id, (entries or {}).get(match.match_id))
         if me is None or me.team is None:
             continue
@@ -483,8 +461,6 @@ def round_stats(
             without_rounds += 1
             continue
         analysed += 1
-        if map_name:
-            map_label = match.map
         team_of = {row.riot_id: row.team for row in match.players}
         pistol_won: dict[int, bool] = {}
         for entry in match.round_log:
@@ -571,6 +547,4 @@ def round_stats(
     }
     if without_rounds:
         result["matches_without_round_data"] = without_rounds
-    if map_name:
-        result["map_filter"] = map_label
     return result

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import quote, unquote, urlencode
 
 from .exceptions import InvalidRiotIdError
 
 SITE_BASE = "https://tracker.gg/valorant"
 API_BASE = "https://api.tracker.gg/api/v2/valorant/standard"
+# Rank distribution, leaderboards, insights, Premier and the reference lists live here.
+DATA_BASE = "https://api.tracker.gg/api/v1/valorant"
 
 _PROFILE_URL_RE = re.compile(r"/profile/riot/([^/?#]+)", re.IGNORECASE)
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
@@ -140,11 +143,63 @@ def segments_url(riot_id: RiotId, playlist: str, season_id: str | None) -> str:
     return f"{profile_url(riot_id)}/segments/playlist?{urlencode({'playlist': playlist, 'source': 'web'})}"
 
 
-def matches_url(riot_id: RiotId, playlist: str, page: int = 0) -> str:
+def matches_url(
+    riot_id: RiotId,
+    playlist: str,
+    page: int = 0,
+    season_id: str | None = None,
+    map_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """A page of the match history. The filters take tracker.gg's IDs, not names."""
     query: dict[str, str | int] = {"platform": "pc", "type": playlist}
+    for name, value in (("season", season_id), ("map", map_id), ("agent", agent_id)):
+        if value:
+            query[name] = value
     if page:
         query["next"] = page
     return f"{API_BASE}/matches/riot/{riot_id.encoded}?{urlencode(query)}"
+
+
+def local_offset_minutes() -> int:
+    """Minutes the local clock is behind UTC, the way a browser reports it.
+
+    Tracker.gg uses it to decide where one day ends and the next begins.
+    """
+    offset = datetime.now().astimezone().utcoffset()
+    return -int(offset.total_seconds() // 60) if offset else 0
+
+
+def aggregate_url(riot_id: RiotId, playlist: str) -> str:
+    query = {"localOffset": local_offset_minutes(), "playlist": playlist}
+    return f"{profile_url(riot_id)}/aggregated?{urlencode(query)}"
+
+
+def stat_history_url(riot_id: RiotId, stat: str, playlist: str) -> str:
+    query = {"localOffset": local_offset_minutes(), "playlist": playlist}
+    return f"{profile_url(riot_id)}/stats/overview/{quote(stat, safe='')}?{urlencode(query)}"
+
+
+def distribution_url(region: str, act_id: str) -> str:
+    query = {"type": "ranked", "platform": "pc", "region": region, "act": act_id}
+    return f"{DATA_BASE}/insights/distribution?{urlencode(query)}"
+
+
+def leaderboard_url(region: str, act_id: str, skip: int, take: int) -> str:
+    query = {"type": "ranked", "platform": "all", "board": "default", "region": region}
+    return f"{DATA_BASE}/standard/leaderboards?{urlencode({**query, 'act': act_id, 'skip': skip, 'take': take})}"
+
+
+def insights_url(kind: str) -> str:
+    return f"{DATA_BASE}/insights/{kind}?playlist=competitive"
+
+
+def premier_url(roster_id: str) -> str:
+    return f"{DATA_BASE}/premier/roster/{quote(roster_id, safe='')}/detailed"
+
+
+def game_data_url() -> str:
+    return f"{DATA_BASE}/db/batch?types=playlists,seasons,weapons,maps,agents"
 
 
 def match_url(match_id: str) -> str:

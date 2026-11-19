@@ -22,7 +22,21 @@ from typing import Any, Literal, Protocol
 import httpx
 
 from config import Settings
-from models import MatchDetails, MatchPage, PlayerProfile, SearchResult, StatsBundle
+from models import (
+    AgentInsight,
+    Aggregate,
+    GameData,
+    Leaderboard,
+    MapInsight,
+    MatchDetails,
+    MatchPage,
+    PlayerProfile,
+    PremierTeam,
+    RankShare,
+    SearchResult,
+    StatHistory,
+    StatsBundle,
+)
 
 from . import parsers, utils
 from .exceptions import (
@@ -409,7 +423,7 @@ class RequestPacer:
         self._last_activity = time.monotonic()
 
 
-Subject = Literal["player", "match", "search"]
+Subject = Literal["player", "match", "search", "data"]
 
 
 def _raise_api_error(status: int, errors: list[Any], subject: Subject, label: str) -> None:
@@ -428,6 +442,8 @@ def _raise_api_error(status: int, errors: list[Any], subject: Subject, label: st
     if "NotFound" in codes or status == 404:
         if subject == "match":
             raise MatchNotFoundError(f"Tracker.gg has no match with the ID {label}.")
+        if subject == "data":
+            raise NoDataError(f"Tracker.gg has no {label}.")
         raise PlayerNotFoundError(
             f"Tracker.gg could not find {label}. The Riot ID may be misspelled, or the "
             "profile does not exist."
@@ -500,8 +516,17 @@ class TrackerScraper:
             return StatsBundle()
         return parsers.parse_stats_bundle(data)
 
-    async def fetch_match_page(self, riot_id: RiotId, playlist: str, page: int = 0) -> MatchPage:
-        url = utils.matches_url(riot_id, playlist, page)
+    async def fetch_match_page(
+        self,
+        riot_id: RiotId,
+        playlist: str,
+        page: int = 0,
+        *,
+        season_id: str | None = None,
+        map_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> MatchPage:
+        url = utils.matches_url(riot_id, playlist, page, season_id, map_id, agent_id)
         try:
             data = await self._get(url, "player", str(riot_id))
         except NoDataError:
@@ -511,6 +536,47 @@ class TrackerScraper:
     async def fetch_match(self, match_id: str) -> MatchDetails:
         data = await self._get(utils.match_url(match_id), "match", match_id)
         return parsers.parse_match(data)
+
+    async def fetch_aggregate(self, riot_id: RiotId, playlist: str) -> Aggregate:
+        """Tracker.gg's own totals over its recent window: teammates, party sizes and days."""
+        url = utils.aggregate_url(riot_id, playlist)
+        try:
+            data = await self._get(url, "player", str(riot_id))
+        except NoDataError:
+            return Aggregate()
+        return parsers.parse_aggregate(data)
+
+    async def fetch_stat_history(self, riot_id: RiotId, stat: str, playlist: str) -> StatHistory:
+        url = utils.stat_history_url(riot_id, stat, playlist)
+        history = parsers.parse_stat_history(await self._get(url, "player", str(riot_id)), stat)
+        if history is None:
+            raise BadRequestError(f"Tracker.gg keeps no history of a stat called '{stat}'.")
+        return history
+
+    async def fetch_distribution(self, region: str, act_id: str) -> list[RankShare]:
+        url = utils.distribution_url(region, act_id)
+        return parsers.parse_distribution(await self._get(url, "data", "rank distribution"))
+
+    async def fetch_leaderboard(
+        self, region: str, act_id: str, skip: int, take: int
+    ) -> Leaderboard:
+        url = utils.leaderboard_url(region, act_id, skip, take)
+        return parsers.parse_leaderboard(await self._get(url, "data", "such leaderboard"))
+
+    async def fetch_agent_insights(self) -> list[AgentInsight]:
+        data = await self._get(utils.insights_url("agents"), "data", "agent insights")
+        return parsers.parse_agent_insights(data)
+
+    async def fetch_map_insights(self) -> list[MapInsight]:
+        data = await self._get(utils.insights_url("maps"), "data", "map insights")
+        return parsers.parse_map_insights(data)
+
+    async def fetch_premier(self, roster_id: str) -> PremierTeam:
+        data = await self._get(utils.premier_url(roster_id), "data", "Premier team with that ID")
+        return parsers.parse_premier(data)
+
+    async def fetch_game_data(self) -> GameData:
+        return parsers.parse_game_data(await self._get(utils.game_data_url(), "data", "game data"))
 
     async def search(self, query: str) -> list[SearchResult]:
         data = await self._get(utils.search_url(query), "search", f"'{query}'")

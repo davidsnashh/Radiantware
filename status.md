@@ -4,7 +4,7 @@ Last updated: 18 November 2026
 
 ## Summary
 
-The server is built and working. All 10 tools were run against the live tracker.gg site and returned real data. The newest changes are in the project folder but were not committed yet when this file was written.
+The server is built and working. All 18 tools were run against the live tracker.gg site and returned real data. The newest changes are in the project folder but were not committed yet when this file was written.
 
 ## What this is
 
@@ -12,7 +12,7 @@ A private MCP server that lets an AI assistant look up Valorant stats. The data 
 
 ## What was built
 
-Ten tools:
+Eighteen tools:
 
 - `get_player_overview`: rank, peak rank, K/D, headshot %, ADR, ACS, win rate and more
 - `get_player_agents`: stats for each agent and each role
@@ -23,6 +23,14 @@ Ten tools:
 - `get_match_rounds`: one match round by round, with every kill in order
 - `get_round_stats`: how rounds go over many matches, for example after the first kill or after a plant
 - `get_teammate_stats`: your most played teammates, their stats, and your record with and without each of them
+- `get_top_teammates`: tracker.gg's own list of your most played teammates over the last months, and how you do solo or in a party
+- `get_daily_stats`: your numbers day by day
+- `get_stat_history`: one stat day by day for about a month, and your ten best matches for it
+- `get_rank_distribution`: how many players are in each rank, and which top percent a rank is
+- `get_leaderboard`: the ranked leaderboard of a region
+- `get_meta_insights`: which agents and maps are strong across all tracked matches
+- `get_premier_team`: a Premier team with its players, stages and matches
+- `get_game_data`: lists of agents, maps, weapons and acts
 - `search_player`: find a Riot ID from a name
 
 Most tools give the main numbers by default and the full stat sheet with `detailed=true`. That adds clutches, multi-kills, trades, rounds survived, first deaths, economy, ability use, attack and defense numbers, buy rounds and kills per weapon. None of it needs extra requests. It all comes in the responses the server already fetched.
@@ -49,6 +57,7 @@ The tools give an assistant what it needs for questions like "Which of my 5 most
 - A code review found about 14 problems. All were fixed and checked again.
 - The extra stats were checked against tracker.gg's own totals on 5 saved matches and 8 live ones. A second review of that work found about 15 more problems, which were also fixed.
 - The round-by-round data was checked the same way on 7 saved matches and on live ones. A third review found 6 more problems, which were also fixed.
+- The last batch (teammate totals, daily stats, stat history, rank distribution, leaderboard, insights, Premier, filters) was run live and reviewed. That review found 11 problems, which were fixed. Part of it could not finish its checks of Premier and the reference lists.
 
 ## What was not tested
 

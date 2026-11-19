@@ -230,6 +230,7 @@ class PlayerProfile(Model):
     seasons: list[Season] = []
     playlists: list[str] = []
     peak_rank: Rank | None = None
+    premier_roster_id: str | None = None
     # Stats for the default playlist and act; tracker.gg leaves maps out here.
     stats: StatsBundle = StatsBundle()
 
@@ -269,6 +270,13 @@ class MatchEntry(Model):
 class MatchPage(Model):
     matches: list[MatchEntry] = []
     next_page: int | None = None
+
+
+class Duel(Model):
+    kills: int = 0
+    deaths: int = 0
+    damage_dealt: int = 0
+    damage_taken: int = 0
 
 
 class MatchPlayer(Model):
@@ -318,10 +326,12 @@ class MatchPlayer(Model):
     credits_spent: int | None = None
     ability_casts: dict[str, int] | None = None
     # Tracker.gg's rating of the match out of 1000, and the separate number
-    # that performance_rank orders the ten players by.
+    # that performance_rank orders the ten players by, with its grade and parts.
     tracker_score: int | None = None
     performance_score: float | None = None
     performance_rank: int | None = None
+    performance_grade: str | None = None
+    performance_parts: dict[str, float] | None = None
     # Tracker.gg's labels for the match, such as "Top Frag" or "Trader".
     tags: list[str] | None = None
     attack: SplitStats | None = None
@@ -329,6 +339,8 @@ class MatchPlayer(Model):
     # Keyed by tracker.gg's buy types: pistol, eco, semi and full.
     buys: dict[str, SplitStats] | None = None
     weapon_kills: dict[str, int] | None = None
+    # Keyed by opponent: how the two of them did against each other.
+    duels: dict[str, Duel] | None = None
 
 
 class MatchTeam(Model):
@@ -349,6 +361,8 @@ class SpikeEvent(Model):
     site: str | None = None
     # Seconds into the round.
     time: float | None = None
+    # Minimap position, as for kills.
+    at: list[float] | None = None
 
 
 class Kill(Model):
@@ -357,6 +371,8 @@ class Kill(Model):
     killer: str | None = None
     victim: str | None = None
     weapon: str | None = None
+    # Set when the weapon's alternate fire made the kill.
+    alt_fire: bool | None = None
     assists: list[str] | None = None
     distance_m: float | None = None
     # Where each of them stood on the minimap, as [x, y] from 0 at the top left to 1.
@@ -390,6 +406,8 @@ class Round(Model):
     attackers: str | None = None
     plant: SpikeEvent | None = None
     defuse: SpikeEvent | None = None
+    # Seconds into the round at which the spike went off.
+    detonated_at: float | None = None
     kills: list[Kill] | None = None
     players: list[RoundPlayer] | None = None
 
@@ -411,3 +429,214 @@ class MatchDetails(Model):
 class SearchResult(Model):
     riot_id: str
     status: str | None = None
+
+
+class TeammateRecord(Model):
+    """A teammate in tracker.gg's own totals, with their numbers in the matches played together."""
+
+    riot_id: str
+    matches: int | None = None
+    wins: int | None = None
+    losses: int | None = None
+    win_rate: float | None = None
+    kd: float | None = None
+    avg_placement: float | None = None
+    last_played: str | None = None
+
+
+class PartyRecord(Model):
+    """The player's own numbers when queueing in a party of one size."""
+
+    party_size: int
+    matches: int | None = None
+    wins: int | None = None
+    losses: int | None = None
+    win_rate: float | None = None
+    kd: float | None = None
+    avg_placement: float | None = None
+
+
+class DayStats(Model):
+    date: str
+    matches: int | None = None
+    wins: int | None = None
+    losses: int | None = None
+    win_rate: float | None = None
+    kills: int | None = None
+    deaths: int | None = None
+    kd: float | None = None
+    adr: float | None = None
+    avg_placement: float | None = None
+    performance_score: float | None = None
+    minutes_played: float | None = None
+
+
+class Aggregate(Model):
+    """Tracker.gg's own totals over its recent window of a player's matches."""
+
+    teammates: list[TeammateRecord] = []
+    parties: list[PartyRecord] = []
+    days: list[DayStats] = []
+
+
+class HistoryPoint(Model):
+    date: str
+    value: float | None = None
+    # Rank history carries these instead of a value.
+    tier: str | None = None
+    rr: int | None = None
+    leaderboard_rank: int | None = None
+
+
+class BestMatch(MatchEntry):
+    # What the stat being ranked came to in this match.
+    value: float | None = None
+
+
+class StatHistory(Model):
+    stat: str | None = None
+    points: list[HistoryPoint] = []
+    best_matches: list[BestMatch] = []
+
+
+class RankShare(Model):
+    tier: str
+    # Percent of the ranked players in the region.
+    share: float | None = None
+    players: int | None = None
+
+
+class LeaderboardRow(Model):
+    rank: int | None = None
+    riot_id: str
+    rr: int | None = None
+    tier: str | None = None
+    wins: int | None = None
+
+
+class Leaderboard(Model):
+    title: str | None = None
+    updated_at: str | None = None
+    rows: list[LeaderboardRow] = []
+
+
+class AgentInsight(Model):
+    _lead = ("agent", "role", "tier")
+
+    agent: str
+    role: str | None = None
+    # Tracker.gg's tier list letter, S at the top.
+    tier: str | None = None
+    pick_rate: float | None = None
+    win_rate: float | None = None
+    kd: float | None = None
+    kills_per_match: float | None = None
+    deaths_per_match: float | None = None
+    assists_per_match: float | None = None
+    damage_delta_per_round: float | None = None
+
+
+class MapInsight(Model):
+    _lead = ("map",)
+
+    map: str
+    # Share of all matches played on the map.
+    play_rate: float | None = None
+    attackers_kd: float | None = None
+    defenders_kd: float | None = None
+
+
+class PremierPlayer(Model):
+    riot_id: str
+    # Set for players on the roster now: member, captain or owner.
+    roster_role: str | None = None
+    # Matches per agent played for the team.
+    agents: dict[str, int] | None = None
+    matches: int | None = None
+    wins: int | None = None
+    losses: int | None = None
+    round_win_rate: float | None = None
+    acs: float | None = None
+    damage_delta_per_round: float | None = None
+    hs_pct: float | None = None
+    kast: float | None = None
+    tracker_score: int | None = None
+    rank: str | None = None
+    peak_rank: str | None = None
+
+
+class PremierStage(Model):
+    stage: str | None = None
+    division: str | None = None
+    score: int | None = None
+    wins: int | None = None
+    losses: int | None = None
+    rounds_won: int | None = None
+    rounds_lost: int | None = None
+    playoff_placement: int | None = None
+
+
+class PremierMatch(Model):
+    match_id: str | None = None
+    played_at: str | None = None
+    opponent: str | None = None
+    map: str | None = None
+    rounds_won: int | None = None
+    rounds_lost: int | None = None
+    won: bool | None = None
+    league_points: int | None = None
+    league_points_change: int | None = None
+
+
+class PremierTeam(Model):
+    roster_id: str
+    name: str | None = None
+    region: str | None = None
+    zone: str | None = None
+    division: str | None = None
+    league_score: int | None = None
+    rank: int | None = None
+    wins: int | None = None
+    losses: int | None = None
+    created_at: str | None = None
+    # The team's all-time numbers on tracker.gg.
+    stats: StatLine | None = None
+    players: list[PremierPlayer] = []
+    stages: list[PremierStage] = []
+    matches: list[PremierMatch] = []
+
+
+class GameAgent(Model):
+    name: str
+    uuid: str | None = None
+    role: str | None = None
+    # Ability names by slot: c, q, e and x.
+    abilities: dict[str, str] | None = None
+
+
+class GameMap(Model):
+    name: str
+    uuid: str | None = None
+
+
+class GameWeapon(Model):
+    name: str
+    category: str | None = None
+    cost: int | None = None
+
+
+class GameAct(Model):
+    id: str
+    name: str
+    starts: str | None = None
+    ends: str | None = None
+
+
+class GameData(Model):
+    """Tracker.gg's reference lists."""
+
+    agents: list[GameAgent] = []
+    maps: list[GameMap] = []
+    weapons: list[GameWeapon] = []
+    acts: list[GameAct] = []
+    playlists: dict[str, str] = {}

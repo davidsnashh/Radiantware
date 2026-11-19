@@ -12,16 +12,36 @@ from typing import Any
 
 from models import (
     Ability,
+    AgentInsight,
     AgentStats,
+    Aggregate,
+    BestMatch,
+    DayStats,
+    Duel,
+    GameAct,
+    GameAgent,
+    GameData,
+    GameMap,
+    GameWeapon,
+    HistoryPoint,
     Kill,
+    Leaderboard,
+    LeaderboardRow,
+    MapInsight,
     MapStats,
     MatchDetails,
     MatchEntry,
     MatchPage,
     MatchPlayer,
     MatchTeam,
+    PartyRecord,
     PlayerProfile,
+    PremierMatch,
+    PremierPlayer,
+    PremierStage,
+    PremierTeam,
     Rank,
+    RankShare,
     RoleStats,
     Round,
     RoundPlayer,
@@ -31,7 +51,10 @@ from models import (
     Shots,
     SpikeEvent,
     SplitStats,
+    StatHistory,
+    StatLine,
     StatsBundle,
+    TeammateRecord,
     TopEntry,
     WeaponStats,
 )
@@ -70,6 +93,18 @@ _ABILITY_SLOTS = {"c": "grenade", "q": "ability1", "e": "ability2", "x": "ultima
 _SIDES = {"attacker": "attack", "defender": "defense"}
 _SIDE_TOTALS = ("rounds", "won", "score", "damage", "dealt", "received")
 _BODY_PARTS = ("head", "body", "leg")
+_DIVISIONS = ("Iron", "Bronze", "Silver", "Gold", "Platinum", "Diamond", "Ascendant", "Immortal")
+# Our name -> tracker.gg's, for the parts its performance score is made of.
+_PERFORMANCE_PARTS = {
+    "damage": "damage",
+    "kill_impact": "killImpact",
+    "death_impact": "deathImpact",
+    "trades": "trades",
+    "assists": "assists",
+    "utility_usage": "utilityUsage",
+    "plants": "plants",
+    "defuses": "defuses",
+}
 # After a surrender tracker.gg lists the rounds that were never played under this result.
 _SURRENDERED = "Surrendered"
 _SPIKE = "Bomb"
@@ -228,6 +263,16 @@ def _rank(stat: Any) -> Rank | None:
 def _tier_name(stat: Any) -> str | None:
     rank = _rank(stat)
     return rank.tier if rank else None
+
+
+def _tier_from_number(number: int | None) -> str | None:
+    """The rank name for the game's tier number: 3 is Iron 1, 26 Immortal 3 and 27 Radiant."""
+    if number is None or not 3 <= number <= 27:
+        return None
+    if number == 27:
+        return "Radiant"
+    division, step = divmod(number - 3, 3)
+    return f"{_DIVISIONS[division]} {step + 1}"
 
 
 def _stat_line(stats: dict[str, Any]) -> dict[str, Any]:
@@ -464,6 +509,7 @@ def parse_profile(data: dict[str, Any]) -> PlayerProfile:
             peak = _rank(stats.get("peakRating") or stats.get("peakRank"))
 
     level = meta.get("accountLevel")
+    roster = meta.get("premierRosterId")
     return PlayerProfile(
         riot_id=info.get("platformUserIdentifier") or info.get("platformUserHandle") or "",
         account_level=level if isinstance(level, int) else None,
@@ -478,50 +524,54 @@ def parse_profile(data: dict[str, Any]) -> PlayerProfile:
         ],
         playlists=[item["id"] for item in meta.get("playlists") or [] if item.get("id")],
         peak_rank=peak,
+        premier_roster_id=roster if isinstance(roster, str) else None,
         stats=parse_stats_bundle(segments),
     )
 
 
+def _own_stats(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Metadata and stats of the one segment a history row carries: the requesting player's."""
+    segment = next(iter(item.get("segments") or []), {})
+    return segment.get("metadata") or {}, segment.get("stats") or {}
+
+
+def _match_entry(item: dict[str, Any]) -> MatchEntry | None:
+    attrs = item.get("attributes") or {}
+    meta = item.get("metadata") or {}
+    if not attrs.get("id"):
+        return None
+    segment_meta, stats = _own_stats(item)
+    return MatchEntry(
+        match_id=attrs["id"],
+        played_at=meta.get("timestamp"),
+        map=meta.get("mapName"),
+        mode=meta.get("modeName"),
+        season=act_label(meta.get("seasonName")),
+        result=meta.get("result") or segment_meta.get("result"),
+        rounds_won=_int(stats, "roundsWon"),
+        rounds_lost=_int(stats, "roundsLost"),
+        agent=segment_meta.get("agentName"),
+        rank=_tier_name(stats.get("rank")),
+        kills=_int(stats, "kills"),
+        deaths=_int(stats, "deaths"),
+        assists=_int(stats, "assists"),
+        kd=_float(stats, "kdRatio"),
+        acs=_float(stats, "scorePerRound", digits=1),
+        adr=_float(stats, "damagePerRound", digits=1),
+        hs_pct=_float(stats, "headshotsPercentage", digits=1),
+        kast=_float(stats, "kAST", digits=1),
+        damage=_int(stats, "damage"),
+        combat_score=_int(stats, "score"),
+        performance_rank=_int(stats, "placement"),
+        tracker_score=_int(stats, "trnPerformanceScore"),
+        last_deaths=_int(stats, "lastDeaths"),
+        suicides=_int(stats, "suicides"),
+        shots_dealt=_shots(stats, "dealt"),
+    )
+
+
 def parse_match_page(data: dict[str, Any]) -> MatchPage:
-    entries = []
-    for item in data.get("matches") or []:
-        attrs = item.get("attributes") or {}
-        meta = item.get("metadata") or {}
-        if not attrs.get("id"):
-            continue
-        # The history only carries the requesting player's own segment.
-        segment = next(iter(item.get("segments") or []), {})
-        segment_meta = segment.get("metadata") or {}
-        stats = segment.get("stats") or {}
-        entries.append(
-            MatchEntry(
-                match_id=attrs["id"],
-                played_at=meta.get("timestamp"),
-                map=meta.get("mapName"),
-                mode=meta.get("modeName"),
-                season=act_label(meta.get("seasonName")),
-                result=meta.get("result") or segment_meta.get("result"),
-                rounds_won=_int(stats, "roundsWon"),
-                rounds_lost=_int(stats, "roundsLost"),
-                agent=segment_meta.get("agentName"),
-                rank=_tier_name(stats.get("rank")),
-                kills=_int(stats, "kills"),
-                deaths=_int(stats, "deaths"),
-                assists=_int(stats, "assists"),
-                kd=_float(stats, "kdRatio"),
-                acs=_float(stats, "scorePerRound", digits=1),
-                adr=_float(stats, "damagePerRound", digits=1),
-                hs_pct=_float(stats, "headshotsPercentage", digits=1),
-                kast=_float(stats, "kAST", digits=1),
-                damage=_int(stats, "damage"),
-                combat_score=_int(stats, "score"),
-                performance_rank=_int(stats, "placement"),
-                tracker_score=_int(stats, "trnPerformanceScore"),
-                last_deaths=_int(stats, "lastDeaths"),
-                suicides=_int(stats, "suicides"),
-                shots_dealt=_shots(stats, "dealt"),
-            )
-        )
+    entries = [entry for item in data.get("matches") or [] if (entry := _match_entry(item))]
     next_page = (data.get("metadata") or {}).get("next")
     return MatchPage(matches=entries, next_page=next_page if isinstance(next_page, int) else None)
 
@@ -544,6 +594,13 @@ def _match_player(segment: dict[str, Any]) -> MatchPlayer:
     first_kills = _int(stats, "firstKills")
     first_deaths = _int(stats, "firstDeaths")
     head_hits = _int(stats, "headshots")
+    scores = meta.get("performanceScores") or {}
+    grade = (scores.get("ratings") or {}).get("qualifier")
+    parts = {
+        name: round(scores[key], 2)
+        for name, key in _PERFORMANCE_PARTS.items()
+        if isinstance(scores.get(key), (int, float)) and not isinstance(scores.get(key), bool)
+    }
     tags = [
         tag["name"] for tag in meta.get("tags") or [] if isinstance(tag, dict) and tag.get("name")
     ]
@@ -590,6 +647,8 @@ def _match_player(segment: dict[str, Any]) -> MatchPlayer:
         tracker_score=_int(stats, "trnPerformanceScore"),
         performance_score=_float(stats, "performance", digits=1),
         performance_rank=_int(stats, "placement"),
+        performance_grade=grade if isinstance(grade, str) else None,
+        performance_parts=parts or None,
         tags=tags or None,
         attack=_scoreboard_side(stats, "attack"),
         defense=_scoreboard_side(stats, "defense"),
@@ -742,6 +801,31 @@ def _add_weapon_kills(
         players[name].weapon_kills = dict(counts.most_common())
 
 
+def _add_duels(
+    players: dict[str, MatchPlayer],
+    kills: list[tuple[str, dict[str, Any]]],
+    damage_rows: list[dict[str, Any]],
+) -> None:
+    """How every pair of opponents did against each other: kills and damage both ways."""
+    duels: dict[str, dict[str, Duel]] = {}
+
+    def between(player: str, opponent: str) -> Duel:
+        return duels.setdefault(player, {}).setdefault(opponent, Duel())
+
+    for killer, event in kills:
+        victim = _identifier(event, "opponentPlatformUserIdentifier")
+        if victim in players:
+            between(killer, victim).kills += 1
+            between(victim, killer).deaths += 1
+    for attacker, victim, row in _team_damage(players, damage_rows):
+        damage = round(_number(row.get("stats") or {}, "damage") or 0)
+        between(attacker, victim).damage_dealt += damage
+        between(victim, attacker).damage_taken += damage
+    for name, found in duels.items():
+        by_kills = sorted(found.items(), key=lambda item: item[1].kills, reverse=True)
+        players[name].duels = {players[other].riot_id: duel for other, duel in by_kills}
+
+
 def _add_round_kills(
     players: dict[str, MatchPlayer],
     kills: list[tuple[str, dict[str, Any]]],
@@ -836,6 +920,7 @@ def _on_minimap(location: Any, details: dict[str, Any]) -> list[float] | None:
 
 def _kill(event: dict[str, Any], map_details: dict[str, Any]) -> Kill:
     meta = event.get("metadata") or {}
+    finish = meta.get("finishingDamage") or {}
     killer = _identifier(event) or None
     stood = next(
         (
@@ -862,7 +947,8 @@ def _kill(event: dict[str, Any], map_details: dict[str, Any]) -> Kill:
         time=_seconds(meta.get("roundTime")),
         killer=killer,
         victim=_identifier(event, "opponentPlatformUserIdentifier") or None,
-        weapon=meta.get("weaponName") or (meta.get("finishingDamage") or {}).get("damageType"),
+        weapon=meta.get("weaponName") or finish.get("damageType"),
+        alt_fire=True if finish.get("isSecondaryFireMode") is True else None,
         assists=helpers or None,
         distance_m=distance,
         killer_at=_on_minimap(stood, map_details),
@@ -870,7 +956,7 @@ def _kill(event: dict[str, Any], map_details: dict[str, Any]) -> Kill:
     )
 
 
-def _spike_event(event: Any) -> SpikeEvent | None:
+def _spike_event(event: Any, map_details: dict[str, Any]) -> SpikeEvent | None:
     if not isinstance(event, dict):
         return None
     site = event.get("site")
@@ -878,6 +964,7 @@ def _spike_event(event: Any) -> SpikeEvent | None:
         by=event.get("platformUserIdentifier"),
         site=site if isinstance(site, str) else None,
         time=_seconds(event.get("roundTime")),
+        at=_on_minimap(event.get("location"), map_details),
     )
 
 
@@ -986,7 +1073,7 @@ def _round_log(
                 if winner and team.team != winner:
                     team.surrendered = True
             continue
-        plant = _spike_event(meta.get("plant"))
+        plant = _spike_event(meta.get("plant"), map_details)
         rounds.append(
             Round(
                 round=number,
@@ -994,7 +1081,8 @@ def _round_log(
                 ending=ending,
                 attackers=attackers.get(number),
                 plant=plant,
-                defuse=_spike_event(meta.get("defuse")),
+                defuse=_spike_event(meta.get("defuse"), map_details),
+                detonated_at=_seconds(meta.get("exploded")),
                 kills=kills.get(number),
                 players=lines.get(number),
             )
@@ -1045,6 +1133,7 @@ def parse_match(data: dict[str, Any]) -> MatchDetails:
         # Tracker.gg lists every player of a free-for-all as a team of their own.
         teams = {}
     kills = _counted_kills(by_name, played("player-round-kills"))
+    _add_duels(by_name, kills, played("player-round-damage"))
     _add_weapon_kills(by_name, kills)
     _add_buys(by_name, by_kind.get("player-loadout", []))
     round_log = None
@@ -1089,3 +1178,348 @@ def parse_search(data: Any) -> list[SearchResult]:
         for item in data or []
         if isinstance(item, dict) and item.get("platformUserIdentifier")
     ]
+
+
+def _record(stats: dict[str, Any]) -> dict[str, Any]:
+    """The match record and the two ratings tracker.gg's totals carry per row."""
+    return {
+        "matches": _int(stats, "matchesPlayed"),
+        "wins": _int(stats, "matchesWon"),
+        "losses": _int(stats, "matchesLost"),
+        "win_rate": _float(stats, "matchesWinPct", digits=1),
+        "kd": _float(stats, "kdRatio"),
+        "avg_placement": _float(stats, "avgPlacement", digits=1),
+    }
+
+
+def parse_aggregate(data: dict[str, Any]) -> Aggregate:
+    teammates = []
+    for item in data.get("teammates") or []:
+        info = item.get("platformInfo") or {}
+        name = info.get("platformUserIdentifier") or info.get("platformUserHandle")
+        if name:
+            teammates.append(
+                TeammateRecord(
+                    riot_id=name,
+                    last_played=(item.get("metadata") or {}).get("lastMatchTimestamp"),
+                    **_record(item.get("stats") or {}),
+                )
+            )
+    # A playlist without matches still comes with a solo row of zeros.
+    parties = [
+        PartyRecord(party_size=item["partySize"], **_record(item.get("stats") or {}))
+        for item in data.get("parties") or []
+        if isinstance(item.get("partySize"), int) and _int(item.get("stats") or {}, "matchesPlayed")
+    ]
+    days = []
+    for item in data.get("heatmaps") or []:
+        stats = item.get("stats") or {}
+        played = _number(stats, "timePlayed")
+        if not item.get("date") or not _int(stats, "matchesPlayed"):
+            continue
+        record = _record(stats)
+        days.append(
+            DayStats(
+                date=str(item["date"])[:10],
+                kills=_int(stats, "kills"),
+                deaths=_int(stats, "deaths"),
+                adr=_float(stats, "damagePerRound", digits=1),
+                performance_score=_float(stats, "performance", digits=1),
+                minutes_played=None if played is None else round(played / 60_000, 1),
+                **record,
+            )
+        )
+    return Aggregate(
+        teammates=sorted(teammates, key=lambda row: row.matches or 0, reverse=True),
+        parties=sorted(parties, key=lambda row: row.party_size),
+        days=sorted(days, key=lambda row: row.date),
+    )
+
+
+def parse_stat_history(data: dict[str, Any], stat_key: str = "") -> StatHistory | None:
+    """A stat's daily values and best matches, or None when tracker.gg does not know the stat.
+
+    stat_key is tracker.gg's key for it, used to read its value out of each best match.
+    """
+    history = data.get("history")
+    if not isinstance(history, dict):
+        return None
+    points = []
+    for item in history.get("data") or []:
+        if not isinstance(item, list) or len(item) != 2 or not isinstance(item[1], dict):
+            continue
+        day, stat = item
+        point = HistoryPoint(date=str(day)[:10])
+        value = stat.get("value")
+        if isinstance(value, list):
+            # Rank comes as [tier, an internal number, leaderboard position].
+            rating = (stat.get("metadata") or {}).get("rr")
+            position = value[2] if len(value) > 2 else None
+            point.tier = value[0] if value and isinstance(value[0], str) else None
+            point.rr = rating if isinstance(rating, int) else None
+            point.leaderboard_rank = position if isinstance(position, int) and position else None
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            point.value = round(float(value), 2)
+        points.append(point)
+    best = []
+    for item in data.get("bestMatches") or []:
+        entry = _match_entry(item)
+        if entry is None:
+            continue
+        # The history rows spell some keys differently from the profile, kdRatio for one.
+        _, stats = _own_stats(item)
+        spelled = next((name for name in stats if name.casefold() == stat_key.casefold()), stat_key)
+        best.append(BestMatch(**entry.model_dump(), value=_float(stats, stat_key, spelled)))
+    return StatHistory(
+        stat=(history.get("metadata") or {}).get("name"),
+        points=sorted(points, key=lambda point: point.date),
+        best_matches=best,
+    )
+
+
+def parse_distribution(data: Any) -> list[RankShare]:
+    return [
+        RankShare(
+            tier=item["tier"],
+            share=round(item["pct"], 2) if isinstance(item.get("pct"), (int, float)) else None,
+            players=item.get("count") if isinstance(item.get("count"), int) else None,
+        )
+        for item in data or []
+        if isinstance(item, dict) and isinstance(item.get("tier"), str)
+    ]
+
+
+def parse_leaderboard(data: dict[str, Any]) -> Leaderboard:
+    rows = []
+    for item in data.get("items") or []:
+        owner = item.get("owner") or {}
+        name = (owner.get("metadata") or {}).get("platformUserIdentifier") or item.get("id")
+        if not isinstance(name, str):
+            continue
+        extra = {
+            (stat.get("metadata") or {}).get("key"): stat.get("value")
+            for stat in owner.get("stats") or []
+            if isinstance(stat, dict)
+        }
+        rating, wins = item.get("value"), extra.get("Wins")
+        rows.append(
+            LeaderboardRow(
+                rank=item.get("rank") if isinstance(item.get("rank"), int) else None,
+                riot_id=name,
+                rr=round(rating) if isinstance(rating, (int, float)) else None,
+                tier=extra.get("Tier") if isinstance(extra.get("Tier"), str) else None,
+                wins=wins if isinstance(wins, int) else None,
+            )
+        )
+    return Leaderboard(
+        title=(data.get("metadata") or {}).get("title"),
+        updated_at=data.get("lastUpdated"),
+        rows=rows,
+    )
+
+
+def parse_agent_insights(data: dict[str, Any]) -> list[AgentInsight]:
+    rows = []
+    for item in data.get("insights") or []:
+        meta = item.get("metadata") or {}
+        stats = item.get("stats") or {}
+        if not meta.get("name"):
+            continue
+        rows.append(
+            AgentInsight(
+                agent=meta["name"],
+                role=meta.get("className"),
+                tier=meta.get("tier"),
+                pick_rate=_float(stats, "pickRate"),
+                win_rate=_float(stats, "wlPercentage", digits=1),
+                kd=_float(stats, "kdRatio"),
+                kills_per_match=_float(stats, "killsPerMatch", digits=1),
+                deaths_per_match=_float(stats, "deathsPerMatch", digits=1),
+                assists_per_match=_float(stats, "assistsPerMatch", digits=1),
+                damage_delta_per_round=_float(stats, "damageDeltaPerRound", digits=1),
+            )
+        )
+    return sorted(rows, key=lambda row: row.pick_rate or 0, reverse=True)
+
+
+def parse_map_insights(data: dict[str, Any]) -> list[MapInsight]:
+    rows = []
+    for item in data.get("insights") or []:
+        meta = item.get("metadata") or {}
+        stats = item.get("stats") or {}
+        if meta.get("name"):
+            rows.append(
+                MapInsight(
+                    map=meta["name"],
+                    play_rate=_float(stats, "matchesPlayed"),
+                    attackers_kd=_float(stats, "attackersKdRatio"),
+                    defenders_kd=_float(stats, "defendersKdRatio"),
+                )
+            )
+    return sorted(rows, key=lambda row: row.play_rate or 0, reverse=True)
+
+
+def parse_premier(data: dict[str, Any]) -> PremierTeam:
+    roles = {}
+    for member in data.get("players") or []:
+        name = member.get("platformUserIdentifier")
+        if name:
+            is_owner, is_captain = member.get("isOwner"), member.get("isCaptain")
+            roles[name] = "owner" if is_owner else "captain" if is_captain else "member"
+    players = []
+    agents: dict[str, dict[str, int]] = {}
+    for row in data.get("playerStats") or []:
+        owner = (row.get("attributes") or {}).get("id")
+        agent = (row.get("metadata") or {}).get("name")
+        if row.get("type") == "player-agent" and owner and agent:
+            played = _int(row.get("stats") or {}, "matchesPlayed") or 0
+            agents.setdefault(owner, {})[agent] = played
+    for row in data.get("playerStats") or []:
+        name = (row.get("metadata") or {}).get("platformUserIdentifier")
+        stats = row.get("stats") or {}
+        if row.get("type") != "player-summary" or not name:
+            continue
+        picks = agents.get((row.get("attributes") or {}).get("id") or "", {})
+        players.append(
+            PremierPlayer(
+                riot_id=name,
+                roster_role=roles.pop(name, None),
+                agents=dict(sorted(picks.items(), key=lambda item: item[1], reverse=True)) or None,
+                matches=_int(stats, "matchesPlayed"),
+                wins=_int(stats, "matchesWon"),
+                losses=_int(stats, "matchesLost"),
+                round_win_rate=_float(stats, "roundsWinPct", digits=1),
+                acs=_float(stats, "scorePerRound", digits=1),
+                damage_delta_per_round=_float(stats, "damageDeltaPerRound", digits=1),
+                hs_pct=_float(stats, "headshotsPercentage", digits=1),
+                kast=_float(stats, "kAST", digits=1),
+                tracker_score=_int(stats, "trnPerformanceScore"),
+                rank=_tier_from_number(_int(stats, "rating")),
+                peak_rank=_tier_from_number(_int(stats, "peakRating")),
+            )
+        )
+    # Roster members tracker.gg has no matches for yet.
+    players += [PremierPlayer(riot_id=name, roster_role=role) for name, role in roles.items()]
+    players.sort(key=lambda row: (row.roster_role is None, -(row.matches or 0)))
+
+    stages = []
+    for season in data.get("seasons") or []:
+        ranking = season.get("ranking") or {}
+        placement = ranking.get("bracketFinalPlacement")
+        stages.append(
+            PremierStage(
+                stage=season.get("seasonName"),
+                division=ranking.get("divisionName"),
+                score=ranking.get("score") if isinstance(ranking.get("score"), int) else None,
+                wins=ranking.get("wins") if isinstance(ranking.get("wins"), int) else None,
+                losses=ranking.get("losses") if isinstance(ranking.get("losses"), int) else None,
+                rounds_won=ranking.get("roundWins"),
+                rounds_lost=ranking.get("roundLosses"),
+                playoff_placement=placement if isinstance(placement, int) and placement else None,
+            )
+        )
+    matches = []
+    for item in data.get("recentMatches") or []:
+        meta = item.get("metadata") or {}
+        # The score sits on the team's own row of the match.
+        own = next(
+            (
+                segment.get("stats") or {}
+                for segment in item.get("segments") or []
+                if segment.get("type") == "team-summary"
+                and (segment.get("attributes") or {}).get("rosterId") == data.get("id")
+            ),
+            {},
+        )
+        matches.append(
+            PremierMatch(
+                match_id=item.get("matchId") or (item.get("attributes") or {}).get("id"),
+                played_at=item.get("matchDate") or meta.get("dateStarted"),
+                opponent=item.get("opponentName"),
+                map=meta.get("mapName"),
+                rounds_won=_int(own, "roundsWon"),
+                rounds_lost=_int(own, "roundsLost"),
+                won=item.get("won") if isinstance(item.get("won"), bool) else None,
+                league_points=item.get("leaguePoints"),
+                league_points_change=item.get("leaguePointsDelta"),
+            )
+        )
+    matches.sort(key=lambda match: match.played_at or "", reverse=True)
+    team = next(iter(data.get("teamStats") or []), {})
+    sheet = _stat_line(team.get("stats") or {})
+    rank = data.get("rank")
+    return PremierTeam(
+        roster_id=data.get("id") or "",
+        name=data.get("name"),
+        region=data.get("region"),
+        zone=data.get("zoneName"),
+        division=data.get("divisionName"),
+        league_score=data.get("leagueScore") if isinstance(data.get("leagueScore"), int) else None,
+        rank=rank if isinstance(rank, int) and rank else None,
+        wins=data.get("wins") if isinstance(data.get("wins"), int) else None,
+        losses=data.get("losses") if isinstance(data.get("losses"), int) else None,
+        created_at=data.get("createdDate"),
+        stats=StatLine(**sheet) if any(value is not None for value in sheet.values()) else None,
+        players=players,
+        stages=stages,
+        matches=matches,
+    )
+
+
+def parse_game_data(data: dict[str, Any]) -> GameData:
+    agents = []
+    for item in data.get("agents") or []:
+        abilities = {
+            slot: ability.get("displayName")
+            for ability in item.get("abilities") or []
+            for slot, key in _ABILITY_SLOTS.items()
+            if str(ability.get("slot") or "").casefold() == key and ability.get("displayName")
+        }
+        role = item.get("role")
+        if isinstance(role, dict):
+            role = role.get("displayName") or role.get("name")
+        if item.get("name"):
+            agents.append(
+                GameAgent(
+                    name=item["name"],
+                    uuid=item.get("uuid"),
+                    role=role if isinstance(role, str) else None,
+                    abilities=abilities or None,
+                )
+            )
+    weapons = [
+        GameWeapon(
+            name=weapon["name"],
+            category=group.get("categoryName"),
+            cost=weapon.get("cost") if isinstance(weapon.get("cost"), int) else None,
+        )
+        for group in data.get("weapons") or []
+        for weapon in group.get("weapons") or []
+        if weapon.get("name")
+    ]
+    acts = [
+        GameAct(
+            id=act["id"],
+            name=act_label(f"{episode.get('shortName')}: {act.get('shortName')}") or act["id"],
+            starts=act.get("startTime"),
+            ends=act.get("endTime"),
+        )
+        for episode in data.get("seasons") or []
+        for act in episode.get("seasons") or []
+        if act.get("id")
+    ]
+    return GameData(
+        agents=sorted(agents, key=lambda agent: agent.name),
+        maps=[
+            GameMap(name=item["name"], uuid=item.get("uuid"))
+            for item in data.get("maps") or []
+            if item.get("name")
+        ],
+        weapons=weapons,
+        acts=sorted(acts, key=lambda act: act.starts or "", reverse=True),
+        playlists={
+            item["value"]: item.get("label") or item["value"]
+            for item in data.get("playlists") or []
+            if item.get("value")
+        },
+    )
