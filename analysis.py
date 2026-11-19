@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from models import MatchDetails, MatchEntry, MatchPlayer, RoundPlayer, SplitStats
+from models import Kill, MatchDetails, MatchEntry, MatchPlayer, RoundPlayer, SplitStats
 from scraper.utils import same_player
 
 # Counts that are added up across matches.
@@ -55,6 +55,8 @@ _OTHER_RATES = ("entry_success_rate", "deaths_traded_rate", "clutch_win_rate")
 _BROKEN_DOWN = ("clutches_by_size", "ability_casts", "weapon_kills")
 _SIDES = ("attack", "defense")
 _BUY_ORDER = ("pistol", "eco", "semi", "full")
+# What tracker.gg names as the weapon when the spike kills a player.
+_SPIKE = "Bomb"
 
 
 def find_player(
@@ -390,7 +392,7 @@ def teammate_stats(
                     "agents": dict(mate.agents.most_common()),
                     "by_map": {name: tally.brief() for name, tally in sorted(mate.by_map.items())},
                     "your_record_with": mate.player_with.brief(),
-                    "your_record_without": without.brief(),
+                    "your_record_without": without.brief() if without.games else None,
                 }
             )
         )
@@ -401,6 +403,17 @@ def teammate_stats(
         "teammates_seen": len(teammates),
         "teammates": rows,
     }
+
+
+def _is_fight(kill: Kill, team_of: Mapping[str, str | None]) -> bool:
+    """Whether a player of one team killed a player of the other.
+
+    Suicides, spike deaths and kills on a teammate are in the log but are not fights.
+    """
+    killers, victims = team_of.get(kill.killer or ""), team_of.get(kill.victim or "")
+    return (
+        killers is not None and victims is not None and killers != victims and kill.weapon != _SPIKE
+    )
 
 
 def team_buy(lines: Sequence[RoundPlayer]) -> str | None:
@@ -477,24 +490,19 @@ def round_stats(
                     sites[side].setdefault(entry.plant.site, _Rounds()).add(won)
 
             lines = entry.players or []
-            mine = next((line for line in lines if line.riot_id == me.riot_id), None)
-            if mine and mine.buy == "pistol":
+            ours = team_buy([line for line in lines if team_of.get(line.riot_id) == me.team])
+            theirs = team_buy([line for line in lines if team_of.get(line.riot_id) != me.team])
+            # The team's buy, so the round still counts when the player was away for it.
+            if ours == "pistol":
                 pistols.add(won)
                 pistol_won[entry.round] = won
             pistol_before = pistol_won.get(entry.round - 1)
             if pistol_before is not None:
                 (after_win if pistol_before else after_loss).add(won)
-            ours = team_buy([line for line in lines if team_of.get(line.riot_id) == me.team])
-            theirs = team_buy([line for line in lines if team_of.get(line.riot_id) != me.team])
             if ours and theirs:
                 economy.setdefault(f"{ours} vs {theirs}", _Rounds()).add(won)
 
-            # Suicides and kills on a teammate are in the log but are not fights.
-            fights = [
-                kill
-                for kill in entry.kills or []
-                if team_of.get(kill.killer) != team_of.get(kill.victim)
-            ]
+            fights = [kill for kill in entry.kills or [] if _is_fight(kill, team_of)]
             if fights:
                 first = fights[0]
                 ours_first = team_of.get(first.killer) == me.team

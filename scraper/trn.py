@@ -10,14 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
+import os
+import plistlib
 import random
+import sys
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from pathlib import Path
+from typing import IO, Any, Literal, Protocol
+from xml.parsers.expat import ExpatError
 
 import httpx
 
@@ -38,7 +44,7 @@ from models import (
     StatsBundle,
 )
 
-from . import parsers, utils
+from . import locks, parsers, utils
 from .exceptions import (
     BackendUnavailableError,
     BadRequestError,
@@ -65,6 +71,14 @@ _CHALLENGE_TITLES = ("just a moment", "attention required", "access denied")
 
 # How long a backend is left alone after Cloudflare blocked it.
 _BLOCK_COOLDOWN = 300.0
+
+# Chrome will not share a profile, so copies of the server that have a browser
+# open at the same time each take one of these.
+_MAX_PROFILES = 3
+# How often a copy looks whether it is its turn to make a request, and how long
+# it waits for one when nothing says how long a request can take.
+_TURN_POLL = 0.1
+_TURN_TIMEOUT = 60.0
 
 _FETCH_JS = """
 async ({url, timeout}) => {
@@ -106,6 +120,35 @@ def _first_line(exc: BaseException) -> str:
     return text.splitlines()[0][:300]
 
 
+def _other_chrome_installs(folders: Sequence[Path] | None = None) -> list[Path]:
+    """Chrome on a Mac in the places the browser library does not look.
+
+    It only tries /Applications/Google Chrome.app. That misses a copy in the
+    user's own Applications folder and one that Finder named "Google Chrome 2".
+    """
+    if sys.platform != "darwin":
+        return []
+    usual = Path("/Applications/Google Chrome.app")
+    found = []
+    for folder in folders or (Path("/Applications"), Path.home() / "Applications"):
+        for app in sorted(folder.glob("Google Chrome*.app")):
+            info = _app_info(app)
+            # Beta and Canary have identifiers of their own.
+            if app != usual and info.get("CFBundleIdentifier") == "com.google.Chrome":
+                name = info.get("CFBundleExecutable") or "Google Chrome"
+                found.append(app / "Contents" / "MacOS" / name)
+    return found
+
+
+def _app_info(app: Path) -> dict[str, Any]:
+    """What a Mac app says about itself, or nothing when that cannot be read."""
+    try:
+        info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    except (OSError, ValueError, ExpatError):
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
 def _load_playwright() -> Any:
     """Prefer patchright, a drop-in Playwright build without the usual automation tells."""
     try:
@@ -134,6 +177,8 @@ class PlaywrightBackend:
         self._driver: Any = None
         self._context: Any = None
         self._page: Any = None
+        self._profile_dir = settings.browser_profile_dir
+        self._profile_lock: IO[bytes] | None = None
         self._user_agent = settings.user_agent
         self._user_agent_checked = settings.user_agent is not None or not settings.headless
         self._idle_task: asyncio.Task[None] | None = None
@@ -243,10 +288,11 @@ class PlaywrightBackend:
         if self._context is not None:
             return
         api = _load_playwright()
-        self._settings.browser_profile_dir.mkdir(parents=True, exist_ok=True)
-        driver = await api.async_playwright().start()
+        self._claim_profile()
+        driver = None
         failures: list[str] = []
         try:
+            driver = await api.async_playwright().start()
             for target in self._launch_targets():
                 try:
                     self._context = await self._open(driver, target)
@@ -258,24 +304,67 @@ class PlaywrightBackend:
                 raise BackendUnavailableError(
                     "Could not start a browser (" + "; ".join(failures) + "). Install Google "
                     "Chrome, run 'patchright install chromium', or point TRN_BROWSER_EXECUTABLE "
-                    "at a Chrome binary. A second running copy of this server would also hold "
-                    "the browser profile."
+                    "at a Chrome binary."
                 )
         except BaseException:
-            with contextlib.suppress(Exception):
-                await driver.stop()
+            try:
+                if driver is not None:
+                    with contextlib.suppress(Exception):
+                        await driver.stop()
+            finally:
+                # Not before the driver is down: it is what closes a half-started browser.
+                self._release_profile()
             raise
         self._driver = driver
-        log.info("browser started (headless=%s)", self._settings.headless)
+        log.info(
+            "browser started (headless=%s, profile=%s)",
+            self._settings.headless,
+            self._profile_dir.name,
+        )
         # Covers a launch whose caller was cancelled and so never schedules this itself.
         self._schedule_idle_close()
+
+    def _claim_profile(self) -> None:
+        """Take a browser profile that no other copy of the server has open."""
+        if self._profile_lock is not None:
+            return
+        base = self._settings.browser_profile_dir
+        for number in range(1, _MAX_PROFILES + 1):
+            profile = base if number == 1 else base.with_name(f"{base.name}-{number}")
+            try:
+                lock = locks.try_lock(profile.with_name(f"{profile.name}.lock"))
+            except OSError as exc:
+                # No file locking here, so carry on the way a single copy would.
+                log.warning("could not lock a browser profile: %s", _first_line(exc))
+                lock = None
+            else:
+                if lock is None:
+                    continue
+            profile.mkdir(parents=True, exist_ok=True)
+            self._profile_dir, self._profile_lock = profile, lock
+            return
+        raise BackendUnavailableError(
+            f"All {_MAX_PROFILES} browser profiles are in use by other running copies of "
+            "this server. Close one of them, or wait until its browser has been idle for a "
+            "while."
+        )
+
+    def _release_profile(self) -> None:
+        if self._profile_lock is not None:
+            self._profile_lock.close()
+            self._profile_lock = None
 
     def _launch_targets(self) -> list[dict[str, str]]:
         if self._settings.browser_executable:
             return [{"executable_path": str(self._settings.browser_executable)}]
+        channel = self._settings.browser_channel
+        targets = [{"channel": channel}]
+        if channel == "chrome":
+            targets += [{"executable_path": str(path)} for path in _other_chrome_installs()]
         # Fall back to the bundled Chromium when the preferred browser is missing.
-        channels = dict.fromkeys([self._settings.browser_channel, "chromium"])
-        return [{"channel": channel} for channel in channels]
+        if channel != "chromium":
+            targets.append({"channel": "chromium"})
+        return targets
 
     async def _open(self, driver: Any, target: dict[str, str]) -> Any:
         context = await self._open_context(driver, target)
@@ -301,7 +390,7 @@ class PlaywrightBackend:
     async def _open_context(self, driver: Any, target: dict[str, str]) -> Any:
         args = [f"--user-agent={self._user_agent}"] if self._user_agent else []
         return await driver.chromium.launch_persistent_context(
-            user_data_dir=str(self._settings.browser_profile_dir),
+            user_data_dir=str(self._profile_dir),
             headless=self._settings.headless,
             no_viewport=True,
             args=args,
@@ -316,9 +405,13 @@ class PlaywrightBackend:
                 with contextlib.suppress(Exception):
                     await context.close()
         finally:
-            if driver is not None:
-                with contextlib.suppress(Exception):
-                    await driver.stop()
+            try:
+                if driver is not None:
+                    with contextlib.suppress(Exception):
+                        await driver.stop()
+            finally:
+                # Only now is the profile free for another copy.
+                self._release_profile()
 
     def _cancel_idle_close(self) -> None:
         if self._idle_task is not None:
@@ -388,39 +481,169 @@ class FlareSolverrBackend:
         return reply
 
 
-class RequestPacer:
-    """Leaves a random, human-like gap between requests and enforces an hourly budget."""
+class _BudgetUsedUp(RateLimitedError):
+    """The local hourly budget is spent, which trying again cannot change."""
 
-    def __init__(self, min_delay: float, max_delay: float, max_per_hour: int) -> None:
+
+class RequestPacer:
+    """Leaves a random, human-like gap between requests and enforces an hourly budget.
+
+    Given a folder, both are shared with every other copy of the server that
+    uses the same folder, so that together they still act like one visitor.
+    Sharing only adds waiting: a copy never goes faster than it would alone.
+    """
+
+    def __init__(
+        self,
+        min_delay: float,
+        max_delay: float,
+        max_per_hour: int,
+        folder: Path | None = None,
+        *,
+        one_at_a_time: bool = True,
+        turn_timeout: float = _TURN_TIMEOUT,
+    ) -> None:
         self._min_delay = min_delay
         self._max_delay = max_delay
         self._max_per_hour = max_per_hour
+        self._one_at_a_time = one_at_a_time
+        self._turn_timeout = turn_timeout
+        self._lock = asyncio.Lock()
+        # This copy's own requests, on a clock that cannot be set.
         self._last_activity = 0.0
         self._recent: deque[float] = deque()
-        self._lock = asyncio.Lock()
+        # Every copy's requests, on the wall clock. The file lists the starts of the
+        # last hour, and its modification time is the last start or finish.
+        self._shared = folder / "pacing.json" if folder else None
+        self._shared_last = 0.0
+        self._shared_recent: list[float] = []
+        self._turn: IO[bytes] | None = None
 
     async def wait(self) -> None:
         async with self._lock:
-            now = time.monotonic()
-            while self._recent and now - self._recent[0] >= 3600:
-                self._recent.popleft()
-            if self._max_per_hour and len(self._recent) >= self._max_per_hour:
-                minutes = (3600 - (now - self._recent[0])) / 60
-                raise RateLimitedError(
-                    f"The local budget of {self._max_per_hour} tracker.gg requests per hour "
-                    f"is used up. The next request is allowed in about {minutes:.0f} minutes."
-                )
-            if self._last_activity:
-                gap = random.uniform(self._min_delay, self._max_delay)
-                remaining = self._last_activity + gap - now
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
-            self._last_activity = time.monotonic()
-            self._recent.append(self._last_activity)
+            turn, self._turn = self._turn, None
+            gap = random.uniform(self._min_delay, self._max_delay)
+            deadline = time.monotonic() + self._turn_timeout
+            while True:
+                if turn is None and time.monotonic() < deadline:
+                    turn = await self._take_turn(deadline)
+                try:
+                    remaining = self._remaining(gap)
+                    if remaining <= 0:
+                        self._record_start()
+                        break
+                except BaseException:
+                    self._end_turn(turn)
+                    raise
+                # Given up for the length of the gap, so that the other copies get in.
+                self._end_turn(turn)
+                turn = None
+                await asyncio.sleep(remaining)
+            if self._one_at_a_time:
+                # Kept until finished(), so other copies wait for the request itself too.
+                self._turn = turn
+            else:
+                self._end_turn(turn)
 
     def finished(self) -> None:
         """Count the gap from the end of a request, however long it took."""
         self._last_activity = time.monotonic()
+        self._shared_last = time.time()
+        if self._shared is not None:
+            with contextlib.suppress(OSError):
+                os.utime(self._shared)
+        turn, self._turn = self._turn, None
+        self._end_turn(turn)
+
+    def _remaining(self, gap: float) -> float:
+        """How long the next request still has to wait. Raises once the budget is used up."""
+        clock, now = time.monotonic(), time.time()
+        while self._recent and clock - self._recent[0] >= 3600:
+            self._recent.popleft()
+        self._load(now)
+        if self._max_per_hour:
+            until_free = []
+            if len(self._recent) >= self._max_per_hour:
+                until_free.append(3600 - (clock - self._recent[0]))
+            if len(self._shared_recent) >= self._max_per_hour:
+                until_free.append(3600 - (now - self._shared_recent[0]))
+            if until_free:
+                raise _BudgetUsedUp(
+                    f"The local budget of {self._max_per_hour} tracker.gg requests per hour "
+                    "is used up. The next request is allowed in about "
+                    f"{max(until_free) / 60:.0f} minutes."
+                )
+        waits = [0.0]
+        if self._last_activity:
+            waits.append(self._last_activity + gap - clock)
+        if self._shared_last:
+            waits.append(self._shared_last + gap - now)
+        return max(waits)
+
+    def _record_start(self) -> None:
+        self._last_activity = time.monotonic()
+        self._recent.append(self._last_activity)
+        self._shared_last = time.time()
+        self._shared_recent.append(self._shared_last)
+        self._save()
+
+    async def _take_turn(self, deadline: float) -> IO[bytes] | None:
+        """Wait until no other copy that shares the folder is deciding or fetching."""
+        while self._shared is not None:
+            try:
+                turn = locks.try_lock(self._shared.with_suffix(".lock"))
+            except OSError as exc:
+                log.warning("pacing is not shared with other copies: %s", _first_line(exc))
+                self._shared = None
+                break
+            if turn is not None:
+                return turn
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "another copy is still busy after %.0f seconds; going ahead",
+                    self._turn_timeout,
+                )
+                break
+            await asyncio.sleep(_TURN_POLL)
+        return None
+
+    @staticmethod
+    def _end_turn(turn: IO[bytes] | None) -> None:
+        if turn is not None:
+            turn.close()
+
+    def _load(self, now: float) -> None:
+        """Take in what every copy has recorded, when the file can be read."""
+        if self._shared is not None:
+            try:
+                self._shared_last = max(self._shared_last, self._shared.stat().st_mtime)
+                starts = [float(start) for start in json.loads(self._shared.read_text())]
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, TypeError) as exc:
+                log.warning("pacing state is unreadable and starts afresh: %s", _first_line(exc))
+            else:
+                self._shared_recent = starts
+        ahead = self._shared_last > now or any(start > now for start in self._shared_recent)
+        # Times from before the clock was set back count as now. Left as they are, the
+        # gap would never pass and the starts would stay in the budget for too long.
+        self._shared_last = min(self._shared_last, now)
+        self._shared_recent = sorted(
+            min(start, now) for start in self._shared_recent if now - start < 3600
+        )
+        if ahead:
+            self._save()
+            if self._shared is not None:
+                with contextlib.suppress(OSError):
+                    os.utime(self._shared, (now, now))
+
+    def _save(self) -> None:
+        if self._shared is None:
+            return
+        try:
+            self._shared.write_text(json.dumps(self._shared_recent))
+        except OSError as exc:
+            log.warning("pacing state could not be saved: %s", _first_line(exc))
 
 
 Subject = Literal["player", "match", "search", "data"]
@@ -474,6 +697,18 @@ def _unwrap(result: FetchResult, subject: Subject, label: str) -> Any:
     return payload["data"]
 
 
+def _longest_request(settings: Settings) -> float:
+    """An upper limit on the time one request can take, in seconds.
+
+    The worst case is a browser that has to start and then sit through a
+    Cloudflare challenge: two launches, five page loads or fetches and three
+    waits for a challenge to clear.
+    """
+    browser = 80 + 5 * settings.request_timeout + 3 * settings.challenge_timeout
+    proxy = settings.flaresolverr_timeout_ms / 1000 + 15
+    return max(browser, proxy)
+
+
 class TrackerScraper:
     """High-level, rate-limited access to tracker.gg's Valorant data."""
 
@@ -483,7 +718,12 @@ class TrackerScraper:
         self._blocked_until: dict[str, float] = {}
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_scrapes)
         self._pacer = RequestPacer(
-            settings.min_delay, settings.max_delay, settings.max_requests_per_hour
+            settings.min_delay,
+            settings.max_delay,
+            settings.max_requests_per_hour,
+            settings.data_dir,
+            one_at_a_time=settings.max_concurrent_scrapes == 1,
+            turn_timeout=_longest_request(settings),
         )
 
     @staticmethod
@@ -595,6 +835,8 @@ class TrackerScraper:
                 await self._pacer.wait()
                 try:
                     return await self._attempt(url, subject, label)
+                except _BudgetUsedUp:
+                    raise
                 except (UpstreamError, RateLimitedError) as exc:
                     if retries >= self._settings.max_retries:
                         raise

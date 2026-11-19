@@ -8,26 +8,50 @@ An MCP server that gives LLM reasoning access to structured Valorant statistics,
 
 ## Quick start
 
-The easiest way to use it is as an extension in Claude Desktop. You need
-Claude Desktop and Google Chrome or Safari.
+From a Mac with nothing set up to asking Claude about your matches. It has
+only been tested on macOS.
 
-1. Pack the server into one file. Run this in the project folder, and again
-   after any code change:
+1. Install [uv](https://docs.astral.sh/uv/). It brings Python with it, and
+   Claude Desktop uses it to install what the server needs:
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. Install [Google Chrome](https://www.google.com/chrome/) and
+   [Claude Desktop](https://claude.ai/download), then open Claude Desktop and
+   sign in.
+
+3. Download the project and go into its folder:
+
+   ```bash
+   git clone https://github.com/davidsnashh/Radiantware.git
+   cd Radiantware
+   ```
+
+   Without git, choose **Code**, then **Download ZIP** on the GitHub page,
+   unzip it and open a terminal in the unzipped folder.
+
+4. Pack the server into one file:
 
    ```bash
    rm -f valorant-trn-stats.mcpb
    zip -rXD valorant-trn-stats.mcpb manifest.json pyproject.toml uv.lock README.md *.py cache scraper -x '*/__pycache__/*' '*.DS_Store'
    ```
 
-2. Double-click `valorant-trn-stats.mcpb`, or run `open valorant-trn-stats.mcpb`.
-3. Click **Install** in Claude Desktop and give it a minute or two to fetch
-   the dependencies.
-4. Start a new chat and ask, for example: "My Riot ID is Name#TAG. What's my
-   rank and K/D this act?"
+5. Double-click `valorant-trn-stats.mcpb`, or run `open valorant-trn-stats.mcpb`.
+   Claude Desktop shows an install screen. Click **Install** and give it a
+   minute or two to fetch the Python packages.
 
-It stays installed, so from then on just open Claude Desktop and ask. Details
-are under [Claude Desktop bundle](#claude-desktop-bundle). Other clients are
-under [Connecting an MCP client](#connecting-an-mcp-client).
+6. Start a new chat and ask, for example: "My Riot ID is Name#TAG. What's my
+   rank and K/D this act?" Allow the tool when Claude asks. The first answer
+   is slower than the later ones, because Chrome has to start in the
+   background.
+
+It stays installed, so from then on just open Claude Desktop and ask. After
+updating or changing the code, repeat steps 4 and 5. Details are under
+[Claude Desktop bundle](#claude-desktop-bundle). Other clients are under
+[Connecting an MCP client](#connecting-an-mcp-client).
 
 ## What it does
 
@@ -204,15 +228,17 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The server uses your installed Google Chrome by default. Without Chrome,
-install the bundled Chromium, which is picked up automatically:
+The server uses your installed Google Chrome by default. On a Mac that
+includes a copy in your own Applications folder and one that Finder named
+"Google Chrome 2". Without Chrome, install the bundled Chromium, which is
+picked up automatically:
 
 ```bash
 uv run patchright install chromium
 ```
 
-If Chrome lives in a non-standard location, set `TRN_BROWSER_EXECUTABLE` to
-the binary's full path.
+If Chrome lives somewhere else, set `TRN_BROWSER_EXECUTABLE` to the binary's
+full path.
 
 ## Running
 
@@ -245,10 +271,12 @@ Clients that are configured through an `mcpServers` JSON block take:
 Clients that register servers on the command line take the same command:
 `uv --directory /absolute/path/to/this/project run server.py`.
 
-Run a single copy of the server. The browser profile can only be used by one
-process at a time, and one process is also what keeps the request pacing
-honest. To share it between several clients, start it once with
-`--transport streamable-http` and point them all at that URL.
+Several copies of the server can run at the same time, which is what happens
+when a client starts one copy per window. Copies that use the same data folder
+act like one visitor: they share the cache, make one request at a time between
+them and count against the same hourly budget. Each copy that has a browser
+open at that moment uses a browser profile of its own, up to three. Copies
+with different data folders know nothing of each other.
 
 ### Claude Desktop bundle
 
@@ -261,14 +289,12 @@ only the source. It is a copy: after changing the code, pack and install it
 again.
 
 - Settings do not come from `.env`. The Chrome path and whether the browser
-  window is hidden are set in the extension's settings in Claude Desktop. The
-  default Chrome path in `manifest.json` is the one for this machine.
+  window is hidden are set in the extension's settings in Claude Desktop. Both
+  can be left as they are.
 - Data goes to `~/.valorant-trn-mcp` instead of `.data`, so it survives
   installing a newer bundle.
-- Claude Desktop starts two copies of the server, and they share that folder.
-  Only one copy can use the browser at a time. If both are asked at the same
-  moment, the second fails until the first closes its browser, which takes
-  two minutes.
+- Claude Desktop starts two copies of the server. They share that folder, so
+  they take turns and count as one visitor.
 - The official packer, `npx @anthropic-ai/mcpb pack . valorant-trn-stats.mcpb`,
   can be used instead. `.mcpbignore` keeps local data and the virtual
   environment out of its output.
@@ -287,7 +313,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `TRN_BROWSER_IDLE_SECONDS` | `120` | Close the browser after this long without requests. `0` keeps it open |
 | `TRN_MIN_DELAY` / `TRN_MAX_DELAY` | `1.5` / `4.0` | Random pause between requests, in seconds |
 | `TRN_MAX_CONCURRENT_SCRAPES` | `1` | Requests in flight at once, `1` or `2`. Keep it at `1` |
-| `TRN_MAX_REQUESTS_PER_HOUR` | `240` | Hourly request cap of one server process. `0` disables it |
+| `TRN_MAX_REQUESTS_PER_HOUR` | `240` | Hourly request cap, shared by the copies that use one data folder. `0` disables it |
 | `TRN_MAX_RETRIES` | `2` | Retries for transient failures, `0` to `3`, with exponential backoff |
 | `TRN_BACKOFF_BASE` | `2.0` | First backoff delay, in seconds |
 | `TRN_REQUEST_TIMEOUT` | `30` | Seconds to wait for one response |
@@ -301,7 +327,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `FLARESOLVERR_URL` | | FlareSolverr endpoint, used as a fallback |
 | `TRN_BACKEND` | `playwright` | Set to `flaresolverr` to make it the primary |
 | `TRN_FLARESOLVERR_TIMEOUT_MS` | `60000` | FlareSolverr challenge timeout |
-| `TRN_DATA_DIR` | `.data` | SQLite cache and browser profile |
+| `TRN_DATA_DIR` | `.data` | SQLite cache, browser profiles and the pacing shared between copies |
 | `TRN_LOG_LEVEL` | `INFO` | Logs go to stderr |
 | `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | `stdio` / `127.0.0.1` / `8000` | Transport defaults |
 
@@ -422,17 +448,18 @@ when the browser is blocked or unavailable, unless `TRN_BACKEND=flaresolverr`.
 
 The scraper is slow on purpose:
 
-- one request at a time
+- one request at a time, also between copies that share a data folder
 - a random 1.5 to 4 second pause after every request
-- at most 240 requests per hour, counted per server process
+- at most 240 requests per hour, counted across those copies
 - two retries with exponential backoff for timeouts and server errors, a
   longer wait after a rate-limit response, and no retry at all after a
   Cloudflare block
 - tool calls that overlap share one scrape instead of each making their own
 
 With `TRN_MAX_CONCURRENT_SCRAPES=2` the pause is measured between the starts
-of two requests rather than after each one finishes. The browser handles one
-request at a time either way, so there is nothing to gain from it.
+of two requests rather than after each one finishes, and copies stop waiting
+for each other's requests to end. The browser handles one request at a time
+either way, so there is nothing to gain from it.
 
 Approximate cost of a call on a cold cache:
 
@@ -525,12 +552,23 @@ config.py              Settings (environment / .env)
 manifest.json          Claude Desktop bundle description
 scraper/
   trn.py               Browser session, FlareSolverr client, pacing, retries
+  locks.py             File locks shared between copies of the server
   parsers.py           Tracker.gg JSON (or HTML-wrapped JSON) to models
   utils.py             Riot ID parsing, playlist names, URL building
   exceptions.py        Error types
 cache/
   sqlite_cache.py      SQLite cache with per-entry TTLs
+tests/                 Offline tests on made-up sample data
 ```
+
+## Tests
+
+```bash
+uv run --with pytest pytest
+```
+
+The tests are offline. They run on made-up sample data and never contact
+tracker.gg.
 
 ## Disclaimer
 

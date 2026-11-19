@@ -34,6 +34,8 @@ CREATE INDEX IF NOT EXISTS cache_expires_at ON cache (expires_at);
 
 Key = tuple[str, str, str]
 
+_SETUP_ATTEMPTS = 5
+
 
 @dataclass(frozen=True, slots=True)
 class CacheEntry:
@@ -104,15 +106,28 @@ class SQLiteCache:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(self._path, timeout=10, check_same_thread=False)
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.executescript(_SCHEMA)
-                conn.commit()
+                self._set_up(conn)
             except sqlite3.Error:
                 conn.close()
                 raise
             self._conn = conn
         return self._conn
+
+    @staticmethod
+    def _set_up(conn: sqlite3.Connection) -> None:
+        # Two copies of the server that create the file at the same moment lock each
+        # other out, and SQLite does not wait for that the way it waits for a write.
+        for attempt in range(_SETUP_ATTEMPTS):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.executescript(_SCHEMA)
+                conn.commit()
+                return
+            except sqlite3.OperationalError:
+                if attempt == _SETUP_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
     def _get(self, key: Key, allow_stale: bool) -> CacheEntry | None:
         try:

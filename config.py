@@ -25,7 +25,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Where the SQLite cache and the browser profile live.
+    # Where the SQLite cache and the browser profiles live. Copies of the server that
+    # use the same folder also share their request pacing through it.
     data_dir: Path = BASE_DIR / ".data"
 
     # Cache lifetimes in seconds.

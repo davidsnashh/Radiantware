@@ -768,19 +768,25 @@ def _add_player_rounds(
     return side_in_round
 
 
+def _by_spike(event: dict[str, Any]) -> bool:
+    finish = (event.get("metadata") or {}).get("finishingDamage") or {}
+    return finish.get("damageType") == _SPIKE
+
+
 def _counted_kills(
     players: dict[str, MatchPlayer], segments: list[dict[str, Any]]
 ) -> list[tuple[str, dict[str, Any]]]:
     """The kill events the scoreboard counts as kills, each with the killer's name.
 
-    The events also list suicides and kills on a teammate, which it does not.
+    The events also list suicides, spike deaths and kills on a teammate, which
+    it does not.
     """
     kills = []
     for segment in segments:
         name = _identifier(segment)
         killer = players.get(name)
         victim = players.get(_identifier(segment, "opponentPlatformUserIdentifier"))
-        if killer is None or killer is victim:
+        if killer is None or killer is victim or _by_spike(segment):
             continue
         if victim is not None and killer.team is not None and killer.team == victim.team:
             continue
@@ -868,8 +874,7 @@ def _add_team_first_deaths(players: dict[str, MatchPlayer], segments: list[dict[
         for event in events:
             name = _identifier(event, "opponentPlatformUserIdentifier")
             victim = players.get(name)
-            cause = ((event.get("metadata") or {}).get("finishingDamage") or {}).get("damageType")
-            if cause == _SPIKE:
+            if _by_spike(event):
                 # The spike kills after the round is decided, which is not a death on the scoreboard.
                 continue
             if victim is None or victim.team is None or victim.team in teams_hit:
@@ -1466,6 +1471,11 @@ def parse_premier(data: dict[str, Any]) -> PremierTeam:
     )
 
 
+def _act_name(episode: dict[str, Any], act: dict[str, Any]) -> str:
+    parts = [str(part) for part in (episode.get("shortName"), act.get("shortName")) if part]
+    return act_label(": ".join(parts)) or act["id"]
+
+
 def parse_game_data(data: dict[str, Any]) -> GameData:
     agents = []
     for item in data.get("agents") or []:
@@ -1500,7 +1510,7 @@ def parse_game_data(data: dict[str, Any]) -> GameData:
     acts = [
         GameAct(
             id=act["id"],
-            name=act_label(f"{episode.get('shortName')}: {act.get('shortName')}") or act["id"],
+            name=_act_name(episode, act),
             starts=act.get("startTime"),
             ends=act.get("endTime"),
         )
