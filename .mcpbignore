@@ -11,3 +11,4 @@ requirements.txt
 status.md
 tests/
 .claude/
+assets/

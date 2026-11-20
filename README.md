@@ -1,10 +1,53 @@
-# Radiantware Valorant-TRN-MCP
+<div align="center">
+
+<h1><img src="assets/banner.svg" alt="Radiantware Valorant-TRN-MCP" width="100%"></h1>
 
 An MCP server that gives LLM reasoning access to structured Valorant statistics, scraped from
 [tracker.gg](https://tracker.gg/valorant).
 
+![version](https://img.shields.io/badge/version-1.0.0-ff5a66?style=flat-square)
+![python](https://img.shields.io/badge/python-3.11%2B-3776ab?style=flat-square)
+![platform](https://img.shields.io/badge/platform-macOS-8b949e?style=flat-square)
+![mcp](https://img.shields.io/badge/MCP-server-24292f?style=flat-square)
 
->All statistics belong to **Tracker Network (TRN)**, who get full credit for them.
+[What you can ask](#what-you-can-ask) · [What you get](#what-you-get) · [Quick start](#quick-start) · [Tools](#tools) · [How it works](#how-it-works) · [Reference](#reference)
+
+</div>
+
+> All statistics belong to **Tracker Network (TRN)**, who get full credit for them.
+
+## What you can ask
+
+Give your Riot ID once, then ask in plain words. The assistant picks the tools
+and does the adding up.
+
+- "Which of my 5 most played teammates has the lowest KD on Split?"
+- "Who has the highest ACS when I play with them on Ascent?"
+- "Show me my win rate when playing with X vs without X."
+- "Which of my 5 most played teammates dies first the most?"
+- "Who on my team baits the most?"
+- "Am I better on attack or defense on Lotus?"
+- "How often do we win a round after getting the first kill?"
+- "Walk me through round 12 of my last match."
+- "Who have I played with the most in the last few months, and do I do better solo or in a five-stack?"
+- "Is my K/D going up or down this month, and what was my best game ever?"
+- "What share of players is my rank in the top of?"
+- "Which agent should I pick on Bind this act?"
+
+## What you get
+
+- **18 tools.** Your profile, agents, maps and weapons, your matches, your
+  teammates, rank history, leaderboards and more.
+- **Round by round.** Every round of a match: who bought what, the plant and
+  the defuse, and each kill in order.
+- **Teammate analysis.** Who you play with most, how they do, and your record
+  with and without each of them.
+- **Polite by design.** One request at a time with a pause in between, and
+  never more than 240 an hour.
+- **Quick the second time.** Results are kept on your computer. A finished
+  match stays for 30 days.
+- **Yours to run.** A small server and your own Chrome, on your own machine.
+  The server needs no account and no API key.
 
 ## Quick start
 
@@ -63,32 +106,68 @@ only been tested on macOS.
    background.
 
 It stays installed, so from then on just open Claude Desktop and ask. After
-updating or changing the code, repeat steps 4 and 5. Details are under
-[Claude Desktop bundle](#claude-desktop-bundle). Other clients are under
-[Connecting an MCP client](#connecting-an-mcp-client).
+updating or changing the code, repeat steps 4 and 5. More about the
+bundle and about other MCP clients is under
+[Other ways to run it](#other-ways-to-run-it).
 
-## What it does
+## Tools
+
+| Tool | What it gives |
+| --- | --- |
+| **You** | |
+| `get_player_overview` | Rank, peak rank, K/D, headshot %, ADR, ACS, win rate and more, for one act or all of them |
+| `get_player_agents` | Stats for each agent and each role |
+| `get_player_maps` | Stats for each map, split by attack and defense |
+| `get_player_weapons` | Kills, deaths, headshot rate and kill distance for each weapon |
+| `get_daily_stats` | Your numbers day by day |
+| `get_stat_history` | One stat over about a month, and your ten best matches for it |
+| **Your matches** | |
+| `get_recent_matches` | Recent matches with your line and every teammate's |
+| `get_match_details` | The full scoreboard of one match |
+| `get_match_rounds` | One match round by round, with every kill in order |
+| `get_round_stats` | How rounds go over many matches: by side, after a plant, on pistol rounds, after the first kill, by buy |
+| **Your teammates** | |
+| `get_teammate_stats` | Your most played teammates, their stats, and your record with and without each |
+| `get_top_teammates` | Tracker.gg's own list of who you play with most, and how you do solo or in a party |
+| `get_premier_team` | A Premier team: standing, players, stages and recent matches |
+| **The bigger picture** | |
+| `get_rank_distribution` | How many players are in each rank, and which top percent a rank is |
+| `get_leaderboard` | The ranked leaderboard of a region |
+| `get_meta_insights` | Which agents and maps are strong across all tracked matches |
+| `get_game_data` | Lists of agents, maps, weapons and acts |
+| `search_player` | Find a Riot ID from a name |
+
+Every parameter is listed under [Using the tools](#using-the-tools).
+
+## How it works
 
 Tracker.gg has no public Valorant API, and Riot's official API is not usable
 for this. The server therefore drives a real browser session, reads the same
 JSON the tracker.gg profile pages load, and exposes it as MCP tools with a
-SQLite cache in front. The host LLM combines the tools to answer questions
-such as:
+SQLite cache in front. The assistant combines the tools to answer your
+question.
 
-- "Which of my 5 most played teammates has the lowest KD on Split?"
-- "Who has the highest ACS when I play with them on Ascent?"
-- "Show me my win rate when playing with X vs without X."
-- "Which of my 5 most played teammates dies first the most?"
-- "Who on my team baits the most?"
-- "Am I better on attack or defense on Lotus?"
-- "How often do we win a round after getting the first kill?"
-- "Walk me through round 12 of my last match."
-- "Who have I played with the most in the last few months, and do I do better solo or in a five-stack?"
-- "Is my K/D going up or down this month, and what was my best game ever?"
-- "What share of players is my rank in the top of?"
-- "Which agent should I pick on Bind this act?"
+```mermaid
+flowchart LR
+    you(["You"]) -->|"a question"| assistant["AI assistant"]
+    assistant -->|"tool calls"| server["Radiantware"]
+    server --> cache[("Cache")]
+    server -->|"slowly, one at a time"| chrome["Chrome on your computer"]
+    chrome --> site["tracker.gg"]
+```
 
-## Tools
+It is slow on purpose. Twenty new matches take about a minute the first time
+and come from the cache after that.
+
+## Reference
+
+Everything below is detail. Open what you need.
+
+<a id="using-the-tools"></a>
+<details>
+<summary><b>Using the tools</b> &nbsp;·&nbsp; parameters, detailed answers, rounds, example calls</summary>
+
+### Parameters and answers
 
 | Tool | Returns |
 | --- | --- |
@@ -191,161 +270,7 @@ inside a team and suicides stay in the round log, since they happened, but
 are not counted as kills anywhere else. A player who was not in the game for
 a round is marked `away` in it and has no buy.
 
-### Stat names
-
-The same names are used in every tool.
-
-| Name | Meaning |
-| --- | --- |
-| `acs`, `adr` | Combat score and damage per round |
-| `kast` | Share of rounds with a kill, assist, survival or trade |
-| `damage_delta_per_round` | Damage dealt minus damage taken, per round |
-| `first_kills`, `first_deaths` | Rounds in which the player got the first kill, or was the first of all ten to die |
-| `team_first_deaths` | Rounds in which the player was the first of their own team to die |
-| `entry_success_rate` | First kills as a share of the rounds the player opened, either way |
-| `rounds`, `rounds_survived`, `last_deaths` | Rounds played, rounds survived, and rounds in which the player was the last one to die |
-| `deaths_traded`, `trade_kills` | Deaths a teammate avenged, and kills that avenged a teammate |
-| `clutches`, `clutches_lost`, `clutches_by_size` | Rounds won or lost as the last one alive, and wins by the number of opponents left (`1v1` to `1v5`) |
-| `multi_kills` | Rounds with three or more kills |
-| `double_kills`, `triple_kills`, `quadra_kills` | Rounds with exactly two, three and four kills |
-| `aces` | Rounds with five kills on a scoreboard. On profile rows it is tracker.gg's own ace count, which can be lower than its five-kill rounds |
-| `shots_dealt`, `shots_received` | Hits by body part (`head`, `body`, `leg`). `hs_pct` is the head share of the hits dealt |
-| `econ_rating` | Damage per 1000 credits spent |
-| `avg_loadout_value`, `credits_spent` | Average worth of the loadout per round, and credits spent in the match |
-| `ability_casts` | Ability uses by slot: `c`, `q`, `e` and `x` |
-| `tracker_score` | Tracker.gg's rating out of 1000 |
-| `performance_score`, `performance_rank` | Tracker.gg's performance number for a match and the position among the ten players by it |
-| `performance_grade`, `performance_parts` | Tracker.gg's grade for that number (pass, merit or distinction) and the parts it is made of |
-| `avg_placement` | The average `performance_rank` over a set of matches, 1 being best |
-| `duels` | Per opponent in a match: kills, deaths and damage both ways |
-| `attack`, `defense` | The player's numbers on one side |
-| `buys`, `buy` | The player's rounds by tracker.gg's buy type. `pistol` is the first round of a half. Otherwise it goes by credits spent in the round: `eco` up to 1000, `semi` up to 3850, `full` from 3900 |
-| `killer_at`, `victim_at` | Minimap positions as `[x, y]`, each from 0 at the top left to 1 |
-| `first_kill_rate`, `first_death_rate`, `team_first_death_rate`, `survival_rate` | In teammate stats: the count as a percentage of the rounds played together |
-| `deaths_traded_rate`, `clutch_win_rate` | In teammate stats: the share of deaths that a teammate avenged, and the share of clutch situations won |
-
-## Requirements
-
-- Python 3.11 or newer
-- Google Chrome, or the Chromium build that patchright can download
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- Node.js, only for the MCP Inspector (`mcp dev`)
-
-## Installation
-
-```bash
-# with uv
-uv sync
-
-# or with pip
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-The server uses your installed Google Chrome by default. On a Mac that
-includes a copy in your own Applications folder and one that Finder named
-"Google Chrome 2". Without Chrome, install the bundled Chromium, which is
-picked up automatically:
-
-```bash
-uv run patchright install chromium
-```
-
-If Chrome lives somewhere else, set `TRN_BROWSER_EXECUTABLE` to the binary's
-full path.
-
-## Running
-
-```bash
-# MCP Inspector, for trying the tools by hand
-uv run mcp dev server.py
-
-# stdio (what desktop clients use)
-uv run server.py
-
-# streamable HTTP on http://127.0.0.1:8000/mcp
-uv run server.py --transport streamable-http --port 8000
-```
-
-### Connecting an MCP client
-
-Clients that are configured through an `mcpServers` JSON block take:
-
-```json
-{
-  "mcpServers": {
-    "valorant-trn-stats": {
-      "command": "uv",
-      "args": ["--directory", "/absolute/path/to/this/project", "run", "server.py"]
-    }
-  }
-}
-```
-
-Clients that register servers on the command line take the same command:
-`uv --directory /absolute/path/to/this/project run server.py`.
-
-Several copies of the server can run at the same time, which is what happens
-when a client starts one copy per window. Copies that use the same data folder
-act like one visitor: they share the cache, make one request at a time between
-them and count against the same hourly budget. Each copy that has a browser
-open at that moment uses a browser profile of its own, up to three. Copies
-with different data folders know nothing of each other.
-
-### Claude Desktop bundle
-
-`manifest.json` describes the server as a Claude Desktop extension.
-[Quick start](#quick-start) has the command that packs it into one file and
-the steps to install it.
-
-Claude Desktop installs the dependencies itself with uv, so the file holds
-only the source. It is a copy: after changing the code, pack and install it
-again.
-
-- Settings do not come from `.env`. The Chrome path and whether the browser
-  window is hidden are set in the extension's settings in Claude Desktop. Both
-  can be left as they are.
-- Data goes to `~/.valorant-trn-mcp` instead of `.data`, so it survives
-  installing a newer bundle.
-- Claude Desktop starts two copies of the server. They share that folder, so
-  they take turns and count as one visitor.
-- The official packer, `npx @anthropic-ai/mcpb pack . valorant-trn-stats.mcpb`,
-  can be used instead. `.mcpbignore` keeps local data and the virtual
-  environment out of its output.
-- The bundle is for your own machine. Do not share it.
-
-## Configuration
-
-Copy `.env.example` to `.env`. Everything is optional.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `TRN_HEADLESS` | `true` | Run the browser without a window |
-| `TRN_BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge` or `chromium` (bundled). Chromium is the automatic fallback |
-| `TRN_BROWSER_EXECUTABLE` | | Full path to a Chrome binary |
-| `TRN_USER_AGENT` | | Override the user agent. Leave empty |
-| `TRN_BROWSER_IDLE_SECONDS` | `120` | Close the browser after this long without requests. `0` keeps it open |
-| `TRN_MIN_DELAY` / `TRN_MAX_DELAY` | `1.5` / `4.0` | Random pause between requests, in seconds |
-| `TRN_MAX_CONCURRENT_SCRAPES` | `1` | Requests in flight at once, `1` or `2`. Keep it at `1` |
-| `TRN_MAX_REQUESTS_PER_HOUR` | `240` | Hourly request cap, shared by the copies that use one data folder. `0` disables it |
-| `TRN_MAX_RETRIES` | `2` | Retries for transient failures, `0` to `3`, with exponential backoff |
-| `TRN_BACKOFF_BASE` | `2.0` | First backoff delay, in seconds |
-| `TRN_REQUEST_TIMEOUT` | `30` | Seconds to wait for one response |
-| `TRN_CHALLENGE_TIMEOUT` | `30` | Seconds to wait for a Cloudflare challenge to clear |
-| `TRN_CACHE_TTL_OVERVIEW` | `2700` | Profile and overview stats, stat history, Premier teams |
-| `TRN_CACHE_TTL_AGENTS` / `TRN_CACHE_TTL_MAPS` | `5400` | Agent, role and weapon tables / map table |
-| `TRN_CACHE_TTL_MATCHES` | `1200` | Match history list, top teammates and daily stats |
-| `TRN_CACHE_TTL_CAREER` | `21600` | All-act totals, rank distribution, insights |
-| `TRN_CACHE_TTL_SEARCH` | `3600` | Search results, leaderboards |
-| `TRN_CACHE_TTL_MATCH_DETAILS` | `2592000` | Scoreboards (finished matches never change) |
-| `FLARESOLVERR_URL` | | FlareSolverr endpoint, used as a fallback |
-| `TRN_BACKEND` | `playwright` | Set to `flaresolverr` to make it the primary |
-| `TRN_FLARESOLVERR_TIMEOUT_MS` | `60000` | FlareSolverr challenge timeout |
-| `TRN_DATA_DIR` | `.data` | SQLite cache, browser profiles and the pacing shared between copies |
-| `TRN_LOG_LEVEL` | `INFO` | Logs go to stderr |
-| `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | `stdio` / `127.0.0.1` / `8000` | Transport defaults |
-
-## Example tool calls
+### Example tool calls
 
 ```jsonc
 // Current rank, peak rank and headline stats, plus career totals
@@ -411,7 +336,179 @@ to die. `team_first_death_rate` counts being the first of their own team to
 die instead. Compare teammates by rates and averages rather than totals, since
 they played different numbers of games with you.
 
-## How it works
+</details>
+
+<a id="stat-names"></a>
+<details>
+<summary><b>Stat names</b> &nbsp;·&nbsp; what every number means</summary>
+
+The same names are used in every tool.
+
+| Name | Meaning |
+| --- | --- |
+| `acs`, `adr` | Combat score and damage per round |
+| `kast` | Share of rounds with a kill, assist, survival or trade |
+| `damage_delta_per_round` | Damage dealt minus damage taken, per round |
+| `first_kills`, `first_deaths` | Rounds in which the player got the first kill, or was the first of all ten to die |
+| `team_first_deaths` | Rounds in which the player was the first of their own team to die |
+| `entry_success_rate` | First kills as a share of the rounds the player opened, either way |
+| `rounds`, `rounds_survived`, `last_deaths` | Rounds played, rounds survived, and rounds in which the player was the last one to die |
+| `deaths_traded`, `trade_kills` | Deaths a teammate avenged, and kills that avenged a teammate |
+| `clutches`, `clutches_lost`, `clutches_by_size` | Rounds won or lost as the last one alive, and wins by the number of opponents left (`1v1` to `1v5`) |
+| `multi_kills` | Rounds with three or more kills |
+| `double_kills`, `triple_kills`, `quadra_kills` | Rounds with exactly two, three and four kills |
+| `aces` | Rounds with five kills on a scoreboard. On profile rows it is tracker.gg's own ace count, which can be lower than its five-kill rounds |
+| `shots_dealt`, `shots_received` | Hits by body part (`head`, `body`, `leg`). `hs_pct` is the head share of the hits dealt |
+| `econ_rating` | Damage per 1000 credits spent |
+| `avg_loadout_value`, `credits_spent` | Average worth of the loadout per round, and credits spent in the match |
+| `ability_casts` | Ability uses by slot: `c`, `q`, `e` and `x` |
+| `tracker_score` | Tracker.gg's rating out of 1000 |
+| `performance_score`, `performance_rank` | Tracker.gg's performance number for a match and the position among the ten players by it |
+| `performance_grade`, `performance_parts` | Tracker.gg's grade for that number (pass, merit or distinction) and the parts it is made of |
+| `avg_placement` | The average `performance_rank` over a set of matches, 1 being best |
+| `duels` | Per opponent in a match: kills, deaths and damage both ways |
+| `attack`, `defense` | The player's numbers on one side |
+| `buys`, `buy` | The player's rounds by tracker.gg's buy type. `pistol` is the first round of a half. Otherwise it goes by credits spent in the round: `eco` up to 1000, `semi` up to 3850, `full` from 3900 |
+| `killer_at`, `victim_at` | Minimap positions as `[x, y]`, each from 0 at the top left to 1 |
+| `first_kill_rate`, `first_death_rate`, `team_first_death_rate`, `survival_rate` | In teammate stats: the count as a percentage of the rounds played together |
+| `deaths_traded_rate`, `clutch_win_rate` | In teammate stats: the share of deaths that a teammate avenged, and the share of clutch situations won |
+
+</details>
+
+<a id="other-ways-to-run-it"></a>
+<details>
+<summary><b>Other ways to run it</b> &nbsp;·&nbsp; from source, other MCP clients, the Claude Desktop bundle</summary>
+
+### Requirements
+
+- Python 3.11 or newer
+- Google Chrome, or the Chromium build that patchright can download
+- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Node.js, only for the MCP Inspector (`mcp dev`)
+
+### Installation
+
+```bash
+# with uv
+uv sync
+
+# or with pip
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+The server uses your installed Google Chrome by default. On a Mac that
+includes a copy in your own Applications folder and one that Finder named
+"Google Chrome 2". Without Chrome, install the bundled Chromium, which is
+picked up automatically:
+
+```bash
+uv run patchright install chromium
+```
+
+If Chrome lives somewhere else, set `TRN_BROWSER_EXECUTABLE` to the binary's
+full path.
+
+### Running
+
+```bash
+# MCP Inspector, for trying the tools by hand
+uv run mcp dev server.py
+
+# stdio (what desktop clients use)
+uv run server.py
+
+# streamable HTTP on http://127.0.0.1:8000/mcp
+uv run server.py --transport streamable-http --port 8000
+```
+
+### Connecting an MCP client
+
+Clients that are configured through an `mcpServers` JSON block take:
+
+```json
+{
+  "mcpServers": {
+    "valorant-trn-stats": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/this/project", "run", "server.py"]
+    }
+  }
+}
+```
+
+Clients that register servers on the command line take the same command:
+`uv --directory /absolute/path/to/this/project run server.py`.
+
+Several copies of the server can run at the same time, which is what happens
+when a client starts one copy per window. Copies that use the same data folder
+act like one visitor: they share the cache, make one request at a time between
+them and count against the same hourly budget. Each copy that has a browser
+open at that moment uses a browser profile of its own, up to three. Copies
+with different data folders know nothing of each other.
+
+### Claude Desktop bundle
+
+`manifest.json` describes the server as a Claude Desktop extension.
+[Quick start](#quick-start) has the command that packs it into one file and
+the steps to install it.
+
+Claude Desktop installs the dependencies itself with uv, so the file holds
+only the source. It is a copy: after changing the code, pack and install it
+again.
+
+- Settings do not come from `.env`. The Chrome path and whether the browser
+  window is hidden are set in the extension's settings in Claude Desktop. Both
+  can be left as they are.
+- Data goes to `~/.valorant-trn-mcp` instead of `.data`, so it survives
+  installing a newer bundle.
+- Claude Desktop starts two copies of the server. They share that folder, so
+  they take turns and count as one visitor.
+- The official packer, `npx @anthropic-ai/mcpb pack . valorant-trn-stats.mcpb`,
+  can be used instead. `.mcpbignore` keeps local data and the virtual
+  environment out of its output.
+- The bundle is for your own machine. Do not share it.
+
+</details>
+
+<a id="settings"></a>
+<details>
+<summary><b>Settings</b> &nbsp;·&nbsp; every option and its default</summary>
+
+Copy `.env.example` to `.env`. Everything is optional.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TRN_HEADLESS` | `true` | Run the browser without a window |
+| `TRN_BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge` or `chromium` (bundled). Chromium is the automatic fallback |
+| `TRN_BROWSER_EXECUTABLE` | | Full path to a Chrome binary |
+| `TRN_USER_AGENT` | | Override the user agent. Leave empty |
+| `TRN_BROWSER_IDLE_SECONDS` | `120` | Close the browser after this long without requests. `0` keeps it open |
+| `TRN_MIN_DELAY` / `TRN_MAX_DELAY` | `1.5` / `4.0` | Random pause between requests, in seconds |
+| `TRN_MAX_CONCURRENT_SCRAPES` | `1` | Requests in flight at once, `1` or `2`. Keep it at `1` |
+| `TRN_MAX_REQUESTS_PER_HOUR` | `240` | Hourly request cap, shared by the copies that use one data folder. `0` disables it |
+| `TRN_MAX_RETRIES` | `2` | Retries for transient failures, `0` to `3`, with exponential backoff |
+| `TRN_BACKOFF_BASE` | `2.0` | First backoff delay, in seconds |
+| `TRN_REQUEST_TIMEOUT` | `30` | Seconds to wait for one response |
+| `TRN_CHALLENGE_TIMEOUT` | `30` | Seconds to wait for a Cloudflare challenge to clear |
+| `TRN_CACHE_TTL_OVERVIEW` | `2700` | Profile and overview stats, stat history, Premier teams |
+| `TRN_CACHE_TTL_AGENTS` / `TRN_CACHE_TTL_MAPS` | `5400` | Agent, role and weapon tables / map table |
+| `TRN_CACHE_TTL_MATCHES` | `1200` | Match history list, top teammates and daily stats |
+| `TRN_CACHE_TTL_CAREER` | `21600` | All-act totals, rank distribution, insights |
+| `TRN_CACHE_TTL_SEARCH` | `3600` | Search results, leaderboards |
+| `TRN_CACHE_TTL_MATCH_DETAILS` | `2592000` | Scoreboards (finished matches never change) |
+| `FLARESOLVERR_URL` | | FlareSolverr endpoint, used as a fallback |
+| `TRN_BACKEND` | `playwright` | Set to `flaresolverr` to make it the primary |
+| `TRN_FLARESOLVERR_TIMEOUT_MS` | `60000` | FlareSolverr challenge timeout |
+| `TRN_DATA_DIR` | `.data` | SQLite cache, browser profiles and the pacing shared between copies |
+| `TRN_LOG_LEVEL` | `INFO` | Logs go to stderr |
+| `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | `stdio` / `127.0.0.1` / `8000` | Transport defaults |
+
+</details>
+
+<a id="under-the-hood"></a>
+<details>
+<summary><b>Under the hood</b> &nbsp;·&nbsp; Cloudflare, rate limiting, caching, private profiles</summary>
 
 ### Cloudflare
 
@@ -515,7 +612,11 @@ the file to clear it.
 Players with private profiles still appear in the scoreboards of public
 players, so teammate analysis covers them.
 
-## Limitations
+</details>
+
+<a id="limitations"></a>
+<details>
+<summary><b>Limitations</b> &nbsp;·&nbsp; what it cannot do</summary>
 
 - Rank rating (RR) is only available for Immortal and Radiant players.
   Tracker.gg does not have it for lower ranks.
@@ -554,9 +655,15 @@ players, so teammate analysis covers them.
 - Tracker.gg changes its site from time to time. If parsing breaks, the
   response shapes are all handled in `scraper/parsers.py`.
 
-Last verified against tracker.gg on 18 November 2026.
+Last verified against tracker.gg on 19 November 2026.
 
-## Project layout
+</details>
+
+<a id="for-developers"></a>
+<details>
+<summary><b>For developers</b> &nbsp;·&nbsp; project layout and tests</summary>
+
+### Project layout
 
 ```
 server.py              MCP server and tools
@@ -573,9 +680,10 @@ scraper/
 cache/
   sqlite_cache.py      SQLite cache with per-entry TTLs
 tests/                 Offline tests on made-up sample data
+assets/                The banner at the top of this page
 ```
 
-## Tests
+### Tests
 
 ```bash
 uv run --with pytest pytest
@@ -583,6 +691,8 @@ uv run --with pytest pytest
 
 The tests are offline. They run on made-up sample data and never contact
 tracker.gg.
+
+</details>
 
 ## Disclaimer
 
