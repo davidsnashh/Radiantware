@@ -1,4 +1,4 @@
-# valorant-trn-mcp
+# Radiantware Valorant-TRN-MCP
 
 An MCP server that gives LLM reasoning access to structured Valorant statistics, scraped from
 [tracker.gg](https://tracker.gg/valorant).
