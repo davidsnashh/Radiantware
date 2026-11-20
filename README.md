@@ -52,7 +52,7 @@ and does the adding up.
 ## Quick start
 
 From a Mac with nothing set up to asking Claude about your matches. It has
-only been tested on macOS.
+only been tested on macOS. Steps for Windows are [further down](#on-windows).
 
 1. Install [uv](https://docs.astral.sh/uv/). It brings Python with it, and
    Claude Desktop uses it to install what the server needs:
@@ -109,6 +109,53 @@ It stays installed, so from then on just open Claude Desktop and ask. After
 updating or changing the code, repeat steps 4 and 5. More about the
 bundle and about other MCP clients is under
 [Other ways to run it](#other-ways-to-run-it).
+
+### On Windows
+
+These steps have not been tried on a Windows PC yet. They are the same six
+steps, typed into PowerShell, with different commands for steps 1, 4 and 5.
+
+1. Install [uv](https://docs.astral.sh/uv/):
+
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+
+   Close PowerShell and open it again afterwards, so that it finds `uv`.
+
+2. Install [Google Chrome](https://www.google.com/chrome/) and
+   [Claude Desktop](https://claude.ai/download), then open Claude Desktop and
+   sign in. Chrome has to be in its usual place: the search for a renamed
+   copy only exists on a Mac.
+
+3. Download the project and go into its folder:
+
+   ```powershell
+   git clone https://github.com/davidsnashh/Radiantware.git
+   cd Radiantware
+   ```
+
+   Without git, choose **Code**, then **Download ZIP** on the GitHub page,
+   unzip it and open PowerShell in the unzipped folder.
+
+4. Pack the server into one file. Windows has no `zip` command, so Python
+   does it, through uv:
+
+   ```powershell
+   uv run --no-project python -m zipfile -c valorant-trn-stats.mcpb manifest.json pyproject.toml uv.lock README.md (Get-ChildItem *.py -Name) cache scraper
+   ```
+
+   It writes the same `valorant-trn-stats.mcpb` into the project folder and
+   replaces an older one. If the server has been run from this folder before,
+   Python's leftover `__pycache__` folders go in as well, which does no harm.
+
+5. Double-click `valorant-trn-stats.mcpb` in File Explorer, or run
+   `start valorant-trn-stats.mcpb`. Claude Desktop shows an install screen.
+   Click **Install** and give it a minute or two to fetch the Python packages.
+
+6. Start a new chat and ask, as in step 6 above.
+
+On Windows the data is kept in `.valorant-trn-mcp` in your user folder.
 
 ## Tools
 
