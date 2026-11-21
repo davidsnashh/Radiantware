@@ -149,6 +149,9 @@ class SQLiteCache:
             return None
         if entry.is_expired and not allow_stale:
             return None
+        if time.time() - entry.expires_at > self._stale_grace:
+            # Too long gone to stand in for fresh data, even when nothing else is there.
+            return None
         return entry
 
     def _set(self, key: Key, value: Any, ttl: float) -> None:

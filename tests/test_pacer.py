@@ -234,7 +234,69 @@ def test_a_copy_asking_back_to_back_lets_another_copy_in(tmp_path):
             asking.cancel()
         return made
 
-    assert asyncio.run(run()) <= 8
+    # The one request under way when the other copy turned up, and at most the next.
+    assert asyncio.run(run()) <= 2
+
+
+def test_two_copies_asking_back_to_back_take_turns(tmp_path):
+    async def run():
+        order = []
+
+        async def keep_asking(name):
+            # The gap is longer than a copy ever sleeps between two looks at the turn.
+            pacing = pacer(tmp_path, gap=0.25)
+            for _ in range(3):
+                await request(pacing, took=0.02)
+                order.append(name)
+
+        await asyncio.gather(keep_asking("one"), keep_asking("other"))
+        return order
+
+    assert asyncio.run(run()) in (["one", "other"] * 3, ["other", "one"] * 3)
+
+
+def test_a_copy_that_is_next_in_line_keeps_the_turn_while_it_waits(tmp_path):
+    async def run():
+        await request(pacer(tmp_path, gap=0.3))
+        waiting = asyncio.create_task(pacer(tmp_path, gap=0.3).wait())
+        await asyncio.sleep(0.1)
+        held = try_lock(tmp_path / "pacing.lock") is None
+        await waiting
+        return held
+
+    assert asyncio.run(run())
+
+
+def test_a_copy_that_just_went_gives_the_turn_up_while_it_waits(tmp_path):
+    async def run():
+        pacing = pacer(tmp_path, gap=0.3)
+        await request(pacing)
+        waiting = asyncio.create_task(pacing.wait())
+        await asyncio.sleep(0.1)
+        free = try_lock(tmp_path / "pacing.lock")
+        if free is not None:
+            free.close()
+        await waiting
+        pacing.finished()
+        return free is not None
+
+    assert asyncio.run(run())
+
+
+def test_a_cancelled_wait_of_the_next_in_line_gives_its_turn_back(tmp_path):
+    async def run():
+        await request(pacer(tmp_path, gap=30))
+        waiting = asyncio.create_task(pacer(tmp_path, gap=30).wait())
+        await asyncio.sleep(0.05)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        return try_lock(tmp_path / "pacing.lock")
+
+    free = asyncio.run(run())
+    assert free is not None
+    free.close()
+    assert len(starts(tmp_path)) == 1
 
 
 def test_an_unreadable_state_file_is_started_afresh(tmp_path):

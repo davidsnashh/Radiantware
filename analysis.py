@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
+from itertools import pairwise
 from typing import Any
 
 from models import Kill, MatchDetails, MatchEntry, MatchPlayer, RoundPlayer, SplitStats
@@ -556,3 +559,158 @@ def round_stats(
     if without_rounds:
         result["matches_without_round_data"] = without_rounds
     return result
+
+
+# Stats a comparison can weigh. For each of them more is better, and none can be negative.
+COMPARABLE = (
+    "acs",
+    "adr",
+    "kd",
+    "kda",
+    "kast",
+    "hs_pct",
+    "win_rate",
+    "round_win_rate",
+    "entry_success_rate",
+    "econ_rating",
+    "tracker_score",
+)
+DEFAULT_WEIGHTS = {"acs": 0.4, "kd": 0.3, "kast": 0.2, "adr": 0.1}
+_COMPARE_METHOD = (
+    "For each stat the best value among the compared players is worth 100 points, and the "
+    "others get their own value as a percentage of it. A contribution is the stat's weight "
+    "times those points, and a player's score is the sum of their contributions. Everything "
+    "is worked out from the rounded numbers shown, so a lead of a few hundredths means nothing."
+)
+
+
+def _weights(given: Mapping[str, float] | None) -> dict[str, float]:
+    """The weights asked for, as shares of 1. Raises ValueError for ones that make no sense."""
+    wanted = dict(DEFAULT_WEIGHTS if given is None else given)
+    unknown = sorted(set(wanted) - set(COMPARABLE))
+    if unknown:
+        raise ValueError(
+            f"Cannot weigh {', '.join(unknown)}. The stats a comparison can use are: "
+            f"{', '.join(COMPARABLE)}."
+        )
+    for stat, weight in wanted.items():
+        if not _is_number(weight):
+            raise ValueError(f"The weight of {stat} has to be a number.")
+        if not math.isfinite(weight):
+            raise ValueError(f"The weight of {stat} has to be a finite number.")
+        if weight < 0:
+            raise ValueError(f"The weight of {stat} must not be negative.")
+    total = sum(wanted.values())
+    if not total:
+        raise ValueError("At least one stat needs a weight above zero.")
+    if not math.isfinite(total):
+        raise ValueError("The weights are too large to add up. Use smaller numbers.")
+    return {stat: weight / total for stat, weight in wanted.items() if weight}
+
+
+def _shown(shares: Mapping[str, float]) -> dict[str, float]:
+    """Shares of 1 as they are shown and used: four decimals that add up to 1."""
+    scale = sum(shares.values())
+    shown = {stat: round(share / scale, 4) for stat, share in shares.items()}
+    lost = next((stat for stat, share in shown.items() if not share), None)
+    if lost:
+        raise ValueError(
+            f"The weight of {lost} is too small next to the others to count. Raise it or "
+            "leave it out."
+        )
+    # Rounding can leave the sum a ten-thousandth off, which the biggest share takes up.
+    biggest = max(shown, key=lambda stat: shown[stat])
+    shown[biggest] = round(shown[biggest] + 1 - sum(shown.values()), 4)
+    return shown
+
+
+def _by_hand(number: Decimal) -> float:
+    """To two decimals with a half going up, so that the sum can be checked on paper."""
+    return float(number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def compare_players(
+    players: Sequence[tuple[str, Mapping[str, Any]]],
+    weights: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
+    """Rank players by a weighted score and show how every stat counted.
+
+    players are (name, stats) pairs. A stat that one of them has no value for
+    is left out for everyone, so that nobody is ranked on fewer stats than the
+    others, and the remaining weights are scaled up to add up to 1 again.
+
+    The numbers shown are the numbers used: weight times points, both as
+    shown, gives the contribution, and the contributions add up to the score.
+    """
+    if len(players) < 2:
+        raise ValueError("A comparison needs at least two players.")
+    wanted = _weights(weights)
+    left_out = {
+        stat: [name for name, stats in players if not _is_amount(stats.get(stat))]
+        for stat in wanted
+    }
+    left_out = {stat: names for stat, names in left_out.items() if names}
+    usable = {stat: share for stat, share in wanted.items() if stat not in left_out}
+    if not usable:
+        raise ValueError(
+            "None of the weighted stats has a value for every player, so there is nothing "
+            "to compare them on."
+        )
+    shares = _shown(usable)
+    best = {stat: max(stats[stat] for _, stats in players) for stat in shares}
+
+    rows = []
+    for name, stats in players:
+        breakdown = {}
+        for stat, weight in shares.items():
+            points = 0.0
+            if best[stat] > 0:
+                points = _by_hand(100 * Decimal(str(stats[stat])) / Decimal(str(best[stat])))
+            breakdown[stat] = {
+                "value": stats[stat],
+                "points": points,
+                "weight": weight,
+                "contribution": _by_hand(Decimal(str(weight)) * Decimal(str(points))),
+            }
+        score = round(sum(part["contribution"] for part in breakdown.values()), 2)
+        rows.append(
+            _known(
+                {
+                    "riot_id": name,
+                    "score": score,
+                    "matches": stats.get("matches"),
+                    "breakdown": breakdown,
+                }
+            )
+        )
+    # The sort is stable, so players with the same score keep the order they came in.
+    rows.sort(key=lambda row: row["score"], reverse=True)
+    rows = [{"rank": rank, **row} for rank, row in enumerate(rows, 1)]
+    for row, behind in pairwise(rows):
+        gaps = {
+            stat: round(part["contribution"] - behind["breakdown"][stat]["contribution"], 2)
+            for stat, part in row["breakdown"].items()
+        }
+        row["ahead_of_next"] = {"by": round(row["score"] - behind["score"], 2), "from": gaps}
+    return _known(
+        {
+            "method": _COMPARE_METHOD,
+            "weights": shares,
+            "default_weights": weights is None,
+            "best_values": best,
+            "ranking": rows,
+            "left_out": {
+                stat: f"no value for {', '.join(names)}" for stat, names in left_out.items()
+            }
+            or None,
+        }
+    )
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_amount(value: Any) -> bool:
+    """A stat value that can be compared: a number that is neither negative nor infinite."""
+    return _is_number(value) and math.isfinite(value) and value >= 0

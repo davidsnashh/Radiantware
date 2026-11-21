@@ -5,7 +5,7 @@
 An MCP server that gives LLM reasoning access to structured Valorant statistics, scraped from
 [tracker.gg](https://tracker.gg/valorant).
 
-![version](https://img.shields.io/badge/version-1.0.0-ff5a66?style=flat-square)
+![version](https://img.shields.io/badge/version-1.1.0-ff5a66?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11%2B-3776ab?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-macOS-8b949e?style=flat-square)
 ![mcp](https://img.shields.io/badge/MCP-server-24292f?style=flat-square)
@@ -36,8 +36,9 @@ and does the adding up.
 
 ## What you get
 
-- **18 tools.** Your profile, agents, maps and weapons, your matches, your
-  teammates, rank history, leaderboards and more.
+- **19 tools.** Your profile, agents, maps and weapons, your matches, your
+  teammates, rank history, leaderboards and more, plus three placeholders for
+  replay files.
 - **Round by round.** Every round of a match: who bought what, the plant and
   the defuse, and each kill in order.
 - **Teammate analysis.** Who you play with most, how they do, and your record
@@ -46,6 +47,10 @@ and does the adding up.
   never more than 240 an hour.
 - **Quick the second time.** Results are kept on your computer. A finished
   match stays for 30 days.
+- **Honest about freshness.** Every answer says whether it was just fetched or
+  came from the cache, and warns in plain words when it may be out of date.
+- **Shows its working.** A comparison ranks players by weights you choose and
+  shows what every stat added to the score.
 - **Yours to run.** A small server and your own Chrome, on your own machine.
   The server needs no account and no API key.
 
@@ -177,14 +182,21 @@ On Windows the data is kept in `.valorant-trn-mcp` in your user folder.
 | `get_teammate_stats` | Your most played teammates, their stats, and your record with and without each |
 | `get_top_teammates` | Tracker.gg's own list of who you play with most, and how you do solo or in a party |
 | `get_premier_team` | A Premier team: standing, players, stages and recent matches |
+| `compare_players` | Two to ten players ranked by a weighted score, with what each stat added |
 | **The bigger picture** | |
 | `get_rank_distribution` | How many players are in each rank, and which top percent a rank is |
 | `get_leaderboard` | The ranked leaderboard of a region |
 | `get_meta_insights` | Which agents and maps are strong across all tracked matches |
 | `get_game_data` | Lists of agents, maps, weapons and acts |
 | `search_player` | Find a Riot ID from a name |
+| **Replays, not built yet** | |
+| `list_local_replays` | The replay files on this computer |
+| `analyze_replay` | A placeholder that says what replay analysis will answer |
+| `get_utility_effectiveness` | A placeholder for what your abilities achieved in a match |
 
-Every parameter is listed under [Using the tools](#using-the-tools).
+Every parameter is listed under [Using the tools](#using-the-tools). The three
+replay tools cannot read a replay yet, and replays only ever exist on the
+computer of someone who played the match: see [Replays](#replays).
 
 ## How it works
 
@@ -236,12 +248,80 @@ Everything below is detail. Open what you need.
 | `get_premier_team(riot_id, roster_id, detailed)` | A Premier team: standing, players, stages and recent matches |
 | `get_game_data(kind)` | Reference lists: agents, maps, weapons, acts, playlists |
 | `search_player(query)` | Riot IDs matching a name |
+| `compare_players(riot_ids, weights, playlist, season, force_refresh)` | A ranking by weighted score, with a breakdown per stat and the lead over the next player |
+| `list_local_replays()` | Replay files on this computer, newest first |
+| `analyze_replay(path, questions)` | Status `not_implemented`, with what is planned |
+| `get_utility_effectiveness(path)` | Status `not_implemented`, with what is planned |
 
-Every tool returns a JSON object. Responses carry `source`, `cached` (false
-when anything had to be scraped for this answer), `fetched_at` and, when
-something degraded, `warnings`. Percentages are on a 0-100 scale. `season`
-accepts `current`, `all`, or an act such as `E26: A5`. The rank distribution
-and the leaderboard are per act, so they take `current` or an act, not `all`.
+Every tool returns a JSON object with the answer under `data`. Answers that
+use tracker.gg data also carry `meta`, which says how fresh they are (see
+below). The replay tools only look at files on this computer, so theirs come
+without it. Percentages are on a 0-100 scale. `season` accepts `current`, `all`, or an act such as
+`E26: A5`. The rank distribution and the leaderboard are per act, so they take
+`current` or an act, not `all`.
+
+### How fresh an answer is
+
+Every answer that uses tracker.gg data carries a `meta` block:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `live` when something was scraped for this answer, `cache` when all of it came from the cache |
+| `cached_at`, `age_seconds` | When the data was scraped, and how long ago that is |
+| `is_stale` | `true` when a scrape failed and older data was served in its place |
+| `stale_reason` | `scrape_failed` for stale data, `within_ttl` for cached data that is still within its lifetime, `null` for live data |
+| `ttl_remaining_seconds` | How long until the data is due for a refresh. `0` once it is past its lifetime |
+| `warnings` | Anything that went wrong, in words. Missing when nothing did |
+| `provider` | Always `tracker.gg` |
+
+What you can rely on:
+
+- A stale answer never looks like a fresh one. `is_stale` is `true`, and the
+  answer starts with a line in plain words before the JSON, for example
+  "⚠️ This data is from the cache and may be outdated (scraped 18 days ago).
+  A fresh copy could not be fetched: ..." followed by the reason. The same
+  line is the first entry of `warnings`.
+- When the rest of an answer was fetched just now and only a part of it is
+  stale, the line says "Part of this data".
+- A refresh you asked for with `force_refresh` that fails is stale as well,
+  even if the old copy was still within its lifetime.
+- An answer put together from several pieces reports the oldest piece and the
+  soonest refresh. Finished matches never change, and the lists of maps, agents
+  and acts are only used to look up a name, so their age is left out of that
+  as long as something else is part of the answer. When one of them could not
+  be refreshed, the answer is stale all the same.
+- Data that expired more than a week ago is never served, stale or not.
+- When there is nothing in the cache to fall back on, the tool fails with the
+  reason instead of answering.
+
+### Comparing players
+
+`compare_players` ranks two to ten players on their stats for an act and shows
+the working, so that it is clear why one player is above another.
+
+- For each weighted stat the best value among the players is worth 100 points.
+  The others get their own value as a percentage of it.
+- A stat's contribution is its weight times those points, and a score is the
+  sum of the contributions. The numbers shown are the numbers used: points are
+  rounded to two decimals and weights to four before anything is multiplied,
+  so every contribution and score can be worked out again from the answer. A
+  lead of a few hundredths means nothing.
+- `ahead_of_next` says by how much a player leads the next one, and how much of
+  that lead comes from each stat. A negative number is a stat the next player
+  is better at.
+- Without `weights` it uses ACS 0.4, K/D 0.3, KAST 0.2 and ADR 0.1, and says so
+  with `default_weights`. Weights you pass are scaled to add up to 1.
+- The stats that can be weighed are `acs`, `adr`, `kd`, `kda`, `kast`,
+  `hs_pct`, `win_rate`, `round_win_rate`, `entry_success_rate`, `econ_rating`
+  and `tracker_score`. For all of them more is better.
+- A stat that one of the players has no value for is left out for everyone and
+  listed under `left_out`. Players without games in that act are listed under
+  `not_ranked`, and `note` points out players with fewer than five matches.
+- A player whose numbers could not be refreshed has `stale: true` in the
+  ranking and is named in `note`.
+
+The points are relative to the players being compared. They say who is ahead
+in this group and by how much, not how good anyone is in general.
 
 ### Headline numbers and the full sheet
 
@@ -367,6 +447,12 @@ a round is marked `away` in it and has no buy.
 
 // Find a tagline
 {"tool": "search_player", "arguments": {"query": "Player"}}
+
+// Rank three players with the default weights
+{"tool": "compare_players", "arguments": {"riot_ids": ["Player#NA1", "Friend#NA1", "Rival#EUW"]}}
+
+// The same, counting only duels and headshots
+{"tool": "compare_players", "arguments": {"riot_ids": ["Player#NA1", "Friend#NA1"], "weights": {"kd": 2, "hs_pct": 1}}}
 ```
 
 Riot IDs are accepted as `Name#TAG`, with stray spaces, URL-encoded
@@ -548,6 +634,7 @@ Copy `.env.example` to `.env`. Everything is optional.
 | `TRN_BACKEND` | `playwright` | Set to `flaresolverr` to make it the primary |
 | `TRN_FLARESOLVERR_TIMEOUT_MS` | `60000` | FlareSolverr challenge timeout |
 | `TRN_DATA_DIR` | `.data` | SQLite cache, browser profiles and the pacing shared between copies |
+| `TRN_REPLAY_DIR` | | Folder with replay files for the replay tools, for example `~/replays`. Empty means the game's own folder, which only exists on Windows |
 | `TRN_LOG_LEVEL` | `INFO` | Logs go to stderr |
 | `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | `stdio` / `127.0.0.1` / `8000` | Transport defaults |
 
@@ -606,12 +693,18 @@ when the browser is blocked or unavailable, unless `TRN_BACKEND=flaresolverr`.
 
 The scraper is slow on purpose:
 
-- one request at a time, also between copies that share a data folder
+- one request at a time, also between copies that share a data folder. The
+  copies take turns: one that is waiting goes before one that has just made a
+  request
 - a random 1.5 to 4 second pause after every request
 - at most 240 requests per hour, counted across those copies
-- two retries with exponential backoff for timeouts and server errors, a
-  longer wait after a rate-limit response, and no retry at all after a
-  Cloudflare block
+- two retries with exponential backoff for timeouts and server errors, and no
+  retry at all after a Cloudflare block
+- when tracker.gg answers that it is rate limiting, nothing is requested for
+  five minutes, and for twice as long each time it says so again, up to an
+  hour. The pause is kept in the data folder, so every copy that shares the
+  folder holds back and a restart does not forget it. Until then the tools
+  answer from the cache, marked as stale
 - tool calls that overlap share one scrape instead of each making their own
 
 With `TRN_MAX_CONCURRENT_SCRAPES=2` the pause is measured between the starts
@@ -633,6 +726,8 @@ Approximate cost of a call on a cold cache:
 | `get_stat_history`, `get_leaderboard`, `get_rank_distribution` | 1 |
 | `get_meta_insights` | 2 |
 | `get_premier_team` | 1, plus 1 to look the team up from a player |
+| `compare_players` | 1 per player, or 2 for all acts, another act or another playlist |
+| The replay tools | 0. They only look at files on this computer |
 | `get_game_data`, and the first use of a map, agent or act filter | 1, then nothing for a week. They are fetched again sooner when the act ends or a name is not on them |
 
 Scoreboards dominate. Twenty new matches take roughly a minute, after which
@@ -644,9 +739,10 @@ long call, run it again: everything fetched so far has been kept.
 Results live in `TRN_DATA_DIR/cache.sqlite3`, keyed by tool, Riot ID and
 parameters, each with its own TTL. One scrape fills the cache for related
 tools (the profile response also feeds the agent table, for example). When
-tracker.gg cannot be reached, an expired entry is returned with a warning
-instead of an error. Pass `force_refresh=true` to bypass the cache, and delete
-the file to clear it.
+tracker.gg cannot be reached, an entry that has expired is served instead of
+an error, for up to a week after it expired, and the answer is marked as stale
+(see [How fresh an answer is](#how-fresh-an-answer-is)). Pass
+`force_refresh=true` to bypass the cache, and delete the file to clear it.
 
 ### Private and missing profiles
 
@@ -658,6 +754,44 @@ the file to clear it.
 
 Players with private profiles still appear in the scoreboards of public
 players, so teammate analysis covers them.
+
+</details>
+
+<a id="replays"></a>
+<details>
+<summary><b>Replays</b> &nbsp;·&nbsp; not built yet, and local only</summary>
+
+Three tools are placeholders for analysing a match from its replay file:
+`list_local_replays`, `analyze_replay` and `get_utility_effectiveness`. The
+first one works and lists the files. The other two check the file and answer
+with status `not_implemented`, what is planned, and which tools answer similar
+questions today.
+
+**Replays are local only.** A replay exists on the computer of a player who
+was in the match and downloaded it in the game, and nowhere else. This server
+cannot fetch a replay, and there is no way to get another player's replays
+through it. Tracker.gg does not have them either.
+
+What else to know:
+
+- Nothing inside a replay is read yet. The format is not documented, and no
+  reader for it exists here.
+- The game only runs on Windows, where it keeps replays in
+  `%LOCALAPPDATA%\VALORANT\Saved\Demos`. On any other system, set
+  `TRN_REPLAY_DIR` to a folder that holds the files.
+- Files ending in `.vrf` or `.dem` count as replays, since guides name both.
+
+What is planned, in `scraper/replay.py`:
+
+| Part | What it will do |
+| --- | --- |
+| `ReplayParser` | Turn a replay file into the match as a list of events |
+| `round_state` | Who was alive and where at any moment, and how a round was won or lost |
+| `line_of_sight` | Who could see whom, and which angles a player held or died from |
+| `utility` | How many flashes blinded an enemy, how many stuns led to a kill, how long smokes covered what they should |
+
+Until then, `get_match_rounds` and `get_round_stats` give the round-by-round
+data that tracker.gg keeps for a match.
 
 </details>
 
@@ -721,6 +855,7 @@ manifest.json          Claude Desktop bundle description
 scraper/
   trn.py               Browser session, FlareSolverr client, pacing, retries
   locks.py             File locks shared between copies of the server
+  replay.py            Local replay files: finding them, and the plan for reading them
   parsers.py           Tracker.gg JSON (or HTML-wrapped JSON) to models
   utils.py             Riot ID parsing, playlist names, URL building
   exceptions.py        Error types

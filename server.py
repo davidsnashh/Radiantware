@@ -49,6 +49,7 @@ from scraper import (
     extract_match_id,
     normalize_playlist,
 )
+from scraper import replay as replays
 from scraper.utils import act_number, match_page_url, profile_page_url, same_player
 
 settings = get_settings()
@@ -100,6 +101,8 @@ SECTION_TTLS = {
     "maps": settings.cache_ttl_maps,
 }
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+# For tools that only look at files on this computer.
+LOCAL = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 # The headline numbers of a stat row, and the fields that label one. The rest
 # of tracker.gg's stat sheet is returned with detailed=True.
 CORE_STATS = frozenset(
@@ -135,6 +138,8 @@ TOP_ENTRY_KEYS = ("name", "matches", "win_rate")
 # How many agents or maps a detailed call returns when none are named, and how
 # many matches: a full stat sheet is long, and a table of them swamps the reader.
 DETAILED_ROWS = 5
+# Below this many matches a comparison says that a player's numbers are thin.
+FEW_MATCHES = 5
 DETAILED_MATCHES = 8
 PREMIER_MATCHES = 20
 # Rows are left off the end of a list once an answer passes this many characters
@@ -206,30 +211,60 @@ mcp = MCPServer(
         "get_daily_stats read tracker.gg's own totals, which cost one request and reach "
         "back months, and get_stat_history follows one stat day by day for about a month. "
         "avg_placement is the average position among the "
-        "ten players of a match by tracker.gg's performance score, 1 being best."
+        "ten players of a match by tracker.gg's performance score, 1 being best. "
+        "compare_players ranks players by a weighted score and shows how each stat counted."
+        "\n\n"
+        'Every answer is {"data": ...}, and answers built on tracker.gg data also carry '
+        '"meta". meta.source is "live" when something was scraped for this answer and '
+        '"cache" when all of it came from the cache, '
+        "meta.cached_at and meta.age_seconds say when the data was scraped, and "
+        "meta.ttl_remaining_seconds how long until it is due for a refresh. When "
+        "meta.is_stale is true the scrape failed and older data was served instead: the "
+        "answer then starts with a warning, and you must tell the user that the numbers may "
+        "be outdated and how old they are."
+        "\n\n"
+        "list_local_replays, analyze_replay and get_utility_effectiveness are placeholders "
+        "for replay files on this computer. Reading replays is not built yet, and replays "
+        "of other players cannot be fetched at all."
     ),
     log_level=settings.log_level,
     lifespan=lifespan,
 )
 
 
-def tool(
-    handler: Callable[..., Awaitable[dict[str, Any]]],
-) -> Callable[..., Awaitable[CallToolResult]]:
-    """Register a read-only tool whose answer goes out as compact JSON.
+def envelope(answer: dict[str, Any]) -> CallToolResult:
+    """A tool's answer as it goes out: {"data": ..., "meta": ...} in compact JSON.
 
     Left to the SDK the text is indented, and about a third of it is whitespace.
+    meta says how fresh the data is. Answers that have nothing to do with
+    tracker.gg come without it.
     """
+    meta = answer.get("meta")
+    data: dict[str, Any] = {"data": {k: v for k, v in answer.items() if k != "meta"}}
+    if meta is not None:
+        data["meta"] = meta
+    text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    content = [TextContent(type="text", text=text)]
+    if meta and meta["is_stale"]:
+        # Said in words first, so that a stale answer cannot pass for a fresh one.
+        content.insert(0, TextContent(type="text", text=meta["warnings"][0]))
+    return CallToolResult(content=content, structured_content=data)
 
-    @functools.wraps(handler)
-    async def compact_answer(*args: Any, **kwargs: Any) -> CallToolResult:
-        data = await handler(*args, **kwargs)
-        text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-        return CallToolResult(
-            content=[TextContent(type="text", text=text)], structured_content=data
-        )
 
-    return mcp.tool(annotations=READ_ONLY)(compact_answer)
+Handler = Callable[..., Awaitable[dict[str, Any]]]
+
+
+def tool(handler: Handler | None = None, *, annotations: ToolAnnotations = READ_ONLY) -> Any:
+    """Register a read-only tool whose answer goes out through envelope()."""
+
+    def register(handler: Handler) -> Callable[..., Awaitable[CallToolResult]]:
+        @functools.wraps(handler)
+        async def answer(*args: Any, **kwargs: Any) -> CallToolResult:
+            return envelope(await handler(*args, **kwargs))
+
+        return mcp.tool(annotations=annotations)(answer)
+
+    return register if handler is None else register(handler)
 
 
 RiotIdArg = Annotated[
@@ -260,6 +295,22 @@ AgentArg = Annotated[
 ]
 RegionArg = Annotated[str, Field(description="Region: na, eu, ap, kr, br or latam.")]
 ActArg = Annotated[str, Field(description='"current", or an act such as "E26: A5".')]
+RiotIdsArg = Annotated[
+    list[str],
+    Field(
+        min_length=2, max_length=10, description="Two to ten Riot IDs to rank against each other."
+    ),
+]
+WeightsArg = Annotated[
+    dict[str, float] | None,
+    Field(
+        description='How much each stat counts, for example {"acs": 0.4, "kd": 0.3, "kast": 0.2, '
+        '"adr": 0.1}, which is also what is used when this is left out. Any numbers that are '
+        "not negative; they are scaled to add up to 1. Stats that can be weighed: "
+        + ", ".join(analysis.COMPARABLE)
+        + "."
+    ),
+]
 DetailedArg = Annotated[
     bool,
     Field(
@@ -276,33 +327,98 @@ class Loaded(NamedTuple):
     fetched_at: float
     cached: bool
     warning: str | None = None
+    expires_at: float | None = None
+    # Served although a fresh copy was wanted, because the scrape for it failed.
+    # warning then holds what went wrong.
+    stale: bool = False
+
+
+def ago(seconds: float) -> str:
+    """An age in words, for example "18 days ago"."""
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            count = int(seconds // size)
+            return f"{count} {unit}{'' if count == 1 else 's'} ago"
+    return "less than a minute ago"
 
 
 class Provenance:
     """Collects how fresh the pieces of one tool response are."""
 
     def __init__(self) -> None:
-        self._oldest: float | None = None
-        self._all_cached = True
+        self._pieces = 0
+        self._scraped = 0
+        # Two of each: over the pieces whose age matters, and over all of them.
+        self._oldest: list[float | None] = [None, None]
+        self._expires: list[float | None] = [None, None]
+        self._stale: list[tuple[float, str]] = []
         self.warnings: list[str] = []
 
     def add(self, loaded: Loaded, *, undated: bool = False) -> None:
         """Record one piece. undated is for data that never changes, whose age says nothing."""
-        if not undated and (self._oldest is None or loaded.fetched_at < self._oldest):
-            self._oldest = loaded.fetched_at
-        self._all_cached = self._all_cached and loaded.cached
-        if loaded.warning and loaded.warning not in self.warnings:
+        self._pieces += 1
+        self._scraped += not loaded.cached
+        # A stale piece is past its lifetime, so its age matters whatever it is.
+        dated = loaded.stale or not undated
+        for index in range(0 if dated else 1, 2):
+            oldest, expires = self._oldest[index], self._expires[index]
+            if oldest is None or loaded.fetched_at < oldest:
+                self._oldest[index] = loaded.fetched_at
+            if loaded.expires_at is not None and (expires is None or loaded.expires_at < expires):
+                self._expires[index] = loaded.expires_at
+        if loaded.stale:
+            self._stale.append((loaded.fetched_at, loaded.warning or "the scrape failed."))
+        elif loaded.warning and loaded.warning not in self.warnings:
             self.warnings.append(loaded.warning)
 
     def as_dict(self) -> dict[str, Any]:
-        info: dict[str, Any] = {"source": "tracker.gg", "cached": self._all_cached}
-        if self._oldest is not None:
-            info["fetched_at"] = datetime.fromtimestamp(self._oldest, UTC).isoformat(
-                timespec="seconds"
+        """The "meta" block of a tool answer."""
+        now = time.time()
+        everything = self._oldest[0] is None
+        oldest = self._oldest[1] if everything else self._oldest[0]
+        expires = self._expires[1] if everything else self._expires[0]
+        from_cache = self._pieces > 0 and not self._scraped
+        reason = "scrape_failed" if self._stale else "within_ttl" if from_cache else None
+        info: dict[str, Any] = {
+            "provider": "tracker.gg",
+            "source": "cache" if from_cache else "live",
+            "cached_at": None,
+            "age_seconds": None,
+            "is_stale": bool(self._stale),
+            "stale_reason": reason,
+            "ttl_remaining_seconds": None if expires is None else max(0, int(expires - now)),
+        }
+        if oldest is not None:
+            info["cached_at"] = datetime.fromtimestamp(oldest, UTC).isoformat(timespec="seconds")
+            info["age_seconds"] = max(0, int(now - oldest))
+        warnings = list(self.warnings)
+        if self._stale:
+            scraped, failure = min(self._stale)
+            # "Part" only when the rest of the answer was scraped just now.
+            part = "Part of this data is" if self._scraped else "This data is"
+            warnings.insert(
+                0,
+                f"\u26a0\ufe0f {part} from the cache and may be outdated (scraped "
+                f"{ago(now - scraped)}). A fresh copy could not be fetched: {failure}",
             )
-        if self.warnings:
-            info["warnings"] = self.warnings
-        return info
+        if warnings:
+            info["warnings"] = warnings
+        return {"meta": info}
+
+    def include(self, other: Provenance) -> None:
+        """Take over the pieces another one has collected."""
+        self._pieces += other._pieces
+        self._scraped += other._scraped
+        for index in range(2):
+            for ours, theirs in ((self._oldest, other._oldest), (self._expires, other._expires)):
+                known = [value for value in (ours[index], theirs[index]) if value is not None]
+                ours[index] = min(known, default=None)
+        self._stale += other._stale
+        self.warnings += [text for text in other.warnings if text not in self.warnings]
+
+    @property
+    def stale(self) -> bool:
+        return bool(self._stale)
 
 
 @contextmanager
@@ -352,7 +468,7 @@ async def load(
         hit = await cache.get(tool, riot_id, key)
         if hit is None or (newer_than is not None and hit.created_at < newer_than):
             return None
-        return Loaded(hit.value, hit.created_at, cached=True)
+        return Loaded(hit.value, hit.created_at, cached=True, expires_at=hit.expires_at)
 
     if not force and (found := await cached(not_before)):
         return found
@@ -370,10 +486,17 @@ async def load(
             if stale is None:
                 raise
             log.warning("serving stale %s data: %s", tool, exc)
-            warning = f"Tracker.gg could not be reached, showing data cached earlier. ({exc})"
-            return Loaded(stale.value, stale.created_at, cached=True, warning=warning)
+            return Loaded(
+                stale.value,
+                stale.created_at,
+                cached=True,
+                warning=str(exc),
+                expires_at=stale.expires_at,
+                stale=True,
+            )
         await cache.set(tool, value, ttl, riot_id, key)
-        return Loaded(value, time.time(), cached=False)
+        now = time.time()
+        return Loaded(value, now, cached=False, expires_at=now + ttl)
 
 
 def compact(data: dict[str, Any]) -> dict[str, Any]:
@@ -577,7 +700,7 @@ async def load_match_entries(
 
 
 async def load_game_data(
-    origin: Provenance | None = None, *, newer_than: float | None = None
+    origin: Provenance | None = None, *, newer_than: float | None = None, undated: bool = False
 ) -> GameData:
     async def fetch() -> dict[str, Any]:
         return (await tracker.fetch_game_data()).dump()
@@ -588,21 +711,24 @@ async def load_game_data(
     current = next((act for act in game.acts if act.starts and act.starts <= now), None)
     if newer_than is None and current and current.ends and current.ends < now:
         # The act these lists call current is over, so they predate the one being played.
-        return await load_game_data(origin, newer_than=time.time() - 3600)
+        return await load_game_data(origin, newer_than=time.time() - 3600, undated=undated)
     if origin:
-        origin.add(loaded)
+        origin.add(loaded, undated=undated)
     return game
 
 
 async def look_up(find: Callable[[GameData], Found], origin: Provenance | None = None) -> Found:
     """Find something in the reference lists, fetching them again once if it is not there.
 
-    An agent, map or act may have come out since the lists were stored.
+    An agent, map or act may have come out since the lists were stored. The
+    lists only name things here, so their age is left out of the answer's, but
+    a copy that could not be refreshed still marks the answer as stale.
     """
     try:
-        return find(await load_game_data(origin))
+        return find(await load_game_data(origin, undated=True))
     except ToolError:
-        return find(await load_game_data(origin, newer_than=time.time() - GAME_DATA_RECHECK))
+        recent = time.time() - GAME_DATA_RECHECK
+        return find(await load_game_data(origin, newer_than=recent, undated=True))
 
 
 async def load_aggregate(rid: RiotId, playlist: str, origin: Provenance) -> Aggregate:
@@ -641,19 +767,19 @@ def find_act(game: GameData, season: str) -> GameAct:
 
 
 async def match_filters(
-    map_name: str | None, agent: str | None, season: str | None = None
+    origin: Provenance, map_name: str | None, agent: str | None, season: str | None = None
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Tracker.gg's IDs for the filters asked for, and the proper names to report back."""
     filters: dict[str, str] = {}
     labels: dict[str, str] = {}
     if map_name:
-        found = await look_up(lambda game: named(game.maps, map_name, "map"))
+        found = await look_up(lambda game: named(game.maps, map_name, "map"), origin)
         filters["map_id"], labels["map_filter"] = found.uuid, found.name
     if agent:
-        found = await look_up(lambda game: named(game.agents, agent, "agent"))
+        found = await look_up(lambda game: named(game.agents, agent, "agent"), origin)
         filters["agent_id"], labels["agent_filter"] = found.uuid, found.name
     if season and season.strip().casefold() not in ALL_ACTS:
-        act = await look_up(lambda game: find_act(game, season))
+        act = await look_up(lambda game: find_act(game, season), origin)
         filters["season_id"], labels["season_filter"] = act.id, act.name
     return filters, labels
 
@@ -1077,7 +1203,7 @@ async def get_recent_matches(
         mode = normalize_playlist(playlist)
         origin = Provenance()
         wanted = min(limit, DETAILED_MATCHES) if detailed else limit
-        filters, labels = await match_filters(map_name, agent, season)
+        filters, labels = await match_filters(origin, map_name, agent, season)
         entries = await load_match_entries(
             rid, mode, skip + wanted, origin, force=force_refresh, filters=filters
         )
@@ -1325,7 +1451,7 @@ async def get_round_stats(
         rid = RiotId.parse(riot_id)
         mode = normalize_playlist(playlist)
         origin = Provenance()
-        filters, labels = await match_filters(map_name, agent)
+        filters, labels = await match_filters(origin, map_name, agent)
         entries = await load_match_entries(rid, mode, limit_matches, origin, filters=filters)
         boards = await load_scoreboards(entries, origin, ctx)
         ordered = [boards[entry.match_id] for entry in entries if entry.match_id in boards]
@@ -1401,7 +1527,7 @@ async def get_teammate_stats(
         rid = RiotId.parse(riot_id)
         mode = normalize_playlist(playlist)
         origin = Provenance()
-        filters, labels = await match_filters(map_name, agent)
+        filters, labels = await match_filters(origin, map_name, agent)
         entries = await load_match_entries(rid, mode, limit_matches, origin, filters=filters)
         boards = await load_scoreboards(entries, origin, ctx)
         ordered = [boards[entry.match_id] for entry in entries if entry.match_id in boards]
@@ -1422,6 +1548,112 @@ async def get_teammate_stats(
                 "one answer. Ask for fewer, or without detailed."
             )
         return {"riot_id": str(rid), "playlist": mode, **labels, **summary, **origin.as_dict()}
+
+
+@tool
+async def compare_players(
+    riot_ids: RiotIdsArg,
+    weights: WeightsArg = None,
+    playlist: PlaylistArg = "competitive",
+    season: SeasonArg = "current",
+    force_refresh: RefreshArg = False,
+) -> dict[str, Any]:
+    """Rank players against each other by a weighted score, and show the working.
+
+    Uses each player's stats for the act, the same numbers get_player_overview
+    returns. For every weighted stat the best value among the players is worth
+    100 points and the others get their value as a percentage of it. A player's
+    score is the sum of weight times points.
+
+    "ranking" lists the players best first. Each has a breakdown per stat
+    (value, points, weight, contribution) that adds up to the score, and
+    ahead_of_next: by how much they lead the next player, and how much of that
+    lead comes from each stat. "weights" are the weights as used, and
+    default_weights says whether they were the defaults.
+
+    A stat that one of the players has no value for is left out for everyone
+    and named under left_out. Players without games in the chosen act are
+    listed under not_ranked. A player whose numbers could not be refreshed has
+    "stale": true in the ranking. A cold call costs one or two requests per
+    player.
+    """
+    with tool_errors():
+        mode = normalize_playlist(playlist)
+        rids = list({rid.key: rid for rid in map(RiotId.parse, riot_ids)}.values())
+        if len(rids) < 2:
+            raise ToolError("Give at least two different Riot IDs to compare.")
+        origin = Provenance()
+        players: list[tuple[str, dict[str, Any]]] = []
+        acts: dict[str, str] = {}
+        outdated: list[str] = []
+        not_ranked: list[str] = []
+        for rid in rids:
+            # Kept apart per player, so that the answer can say whose numbers are old.
+            own = Provenance()
+            profile = await load_profile(rid, own, force=force_refresh)
+            name = profile.riot_id or str(rid)
+            if name in acts or name in not_ranked:
+                name = str(rid)
+            try:
+                season_id = resolve_season(profile, season)
+            except ToolError as exc:
+                raise ToolError(f"{name}: {exc}") from exc
+            is_default = mode == profile.default_playlist and season_id == profile.default_season
+            stats = await load_section(
+                rid, "season_stats", mode, season_id, own, force=force_refresh and not is_default
+            )
+            origin.include(own)
+            if not stats or not stats.get("matches"):
+                not_ranked.append(name)
+                continue
+            players.append((name, stats))
+            acts[name] = season_label(profile, season_id)
+            if own.stale:
+                outdated.append(name)
+        if len(players) < 2:
+            raise ToolError(
+                f"Fewer than two of these players have {mode} games in that act, so there "
+                "is nothing to compare."
+            )
+        try:
+            result = analysis.compare_players(players, weights)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+
+        notes = []
+        same_act = len(set(acts.values())) == 1
+        for row in result["ranking"]:
+            if not same_act:
+                row["season"] = acts[row["riot_id"]]
+            if row["riot_id"] in outdated:
+                row["stale"] = True
+        if not same_act:
+            notes.append(
+                'The numbers are from different acts, because "current" is the act '
+                "tracker.gg shows for each player."
+            )
+        if outdated:
+            notes.append(
+                f"A fresh copy could not be fetched for {', '.join(outdated)}, so their "
+                "numbers may be outdated."
+            )
+        few = [
+            f"{row['riot_id']} ({row['matches']})"
+            for row in result["ranking"]
+            if row["matches"] < FEW_MATCHES
+        ]
+        if few:
+            notes.append(f"Played few matches, so their numbers say less: {', '.join(few)}.")
+        return compact(
+            {
+                "playlist": mode,
+                "season": next(iter(acts.values())) if same_act else None,
+                **result,
+                "not_ranked": not_ranked or None,
+                "note": " ".join(notes) or None,
+                **origin.as_dict(),
+            }
+        )
 
 
 def region_key(region: str) -> str:
@@ -1583,14 +1815,14 @@ async def get_rank_distribution(
     """
     with tool_errors():
         where = region_key(region)
-        act = await look_up(lambda game: find_act(game, season))
+        origin = Provenance()
+        act = await look_up(lambda game: find_act(game, season), origin)
 
         async def fetch() -> list[dict[str, Any]]:
             return [row.dump() for row in await tracker.fetch_distribution(where, act.id)]
 
         params = {"region": where, "act": act.id}
         loaded = await load("distribution", "", params, settings.cache_ttl_career, fetch)
-        origin = Provenance()
         origin.add(loaded)
         tiers, above = [], 0.0
         for row in reversed(loaded.value):
@@ -1621,7 +1853,8 @@ async def get_leaderboard(
     """
     with tool_errors():
         where = region_key(region)
-        act = await look_up(lambda game: find_act(game, season))
+        origin = Provenance()
+        act = await look_up(lambda game: find_act(game, season), origin)
         skip = start_rank - 1
 
         async def fetch() -> dict[str, Any]:
@@ -1629,7 +1862,6 @@ async def get_leaderboard(
 
         params = {"region": where, "act": act.id, "skip": skip, "take": limit}
         loaded = await load("leaderboard", "", params, settings.cache_ttl_search, fetch)
-        origin = Provenance()
         origin.add(loaded)
         rows = loaded.value.get("rows", [])
         return compact(
@@ -1780,6 +2012,106 @@ async def search_player(
             "results": loaded.value,
             **origin.as_dict(),
         }
+
+
+ReplayPathArg = Annotated[
+    str,
+    Field(description="Path of a replay file on this computer, as list_local_replays gives it."),
+]
+
+
+@tool(annotations=LOCAL)
+async def list_local_replays() -> dict[str, Any]:
+    """Replay files on this computer, newest first.
+
+    Looks in the folder set as TRN_REPLAY_DIR, or else in the game's own replay
+    folder, which only exists on Windows. Each file comes with its name, path,
+    size and the time it was last changed.
+
+    Replays are local only. A replay exists on the computer of a player who
+    was in the match and downloaded it in the game, and other players' replays
+    cannot be fetched from anywhere. Reading what is inside a replay is not
+    built yet, so analysis_available is false.
+    """
+    with tool_errors():
+        folder = settings.replay_dir or replays.default_folder()
+        files = replays.find_replays(folder)
+        note = None
+        if folder is None:
+            note = (
+                "No replay folder is known on this computer. The game only runs on Windows, "
+                "where it keeps replays in %LOCALAPPDATA%\\VALORANT\\Saved\\Demos. To use "
+                "replay files here, set TRN_REPLAY_DIR to the folder they are in."
+            )
+        elif not folder.exists():
+            note = f"The replay folder {folder} does not exist."
+        elif not folder.is_dir():
+            note = f"{folder} is not a folder, so it holds no replays."
+        elif not files:
+            note = (
+                f"There are no replay files in {folder}. A replay appears there once it has "
+                "been downloaded in the game."
+            )
+        return compact(
+            {
+                "folder": str(folder) if folder else None,
+                "count": len(files),
+                "replays": [file.describe() for file in files],
+                "analysis_available": False,
+                "note": note,
+                "limitations": [replays.LOCAL_ONLY, replays.UNDOCUMENTED],
+            }
+        )
+
+
+@tool(annotations=LOCAL)
+async def analyze_replay(
+    path: ReplayPathArg,
+    questions: Annotated[
+        list[str] | None,
+        Field(description="What you want to know about the match, in plain words."),
+    ] = None,
+) -> dict[str, Any]:
+    """Not built yet: answer questions about one match from its replay file.
+
+    Checks that the file exists and returns status "not_implemented" with what
+    is planned (round state, line of sight, utility) and which tools answer
+    similar questions today. No part of the replay is read.
+
+    Replays are local only: the file has to be on this computer already, and
+    other players' replays cannot be fetched.
+    """
+    with tool_errors():
+        answer = replays.not_built(
+            "Replay analysis",
+            replays.open_replay(path),
+            replays.PLANNED,
+            "get_match_rounds tells a match round by round, kill by kill, from tracker.gg's "
+            "data, and get_round_stats sums up how rounds go over many matches.",
+        )
+        return {**answer, "questions": questions or []}
+
+
+@tool(annotations=LOCAL)
+async def get_utility_effectiveness(path: ReplayPathArg) -> dict[str, Any]:
+    """Not built yet: what a player's abilities achieved in one match.
+
+    Meant to answer questions such as "how many of my flashes blinded an
+    enemy?" and "how many stuns led to a kill?" from a replay file. For now it
+    checks that the file exists and returns status "not_implemented" with what
+    is planned. No part of the replay is read.
+
+    Replays are local only: the file has to be on this computer already, and
+    other players' replays cannot be fetched.
+    """
+    with tool_errors():
+        return replays.not_built(
+            "Utility analysis",
+            replays.open_replay(path),
+            (replays.UTILITY,),
+            "ability_casts in get_match_details and get_player_agents counts how often each "
+            "ability was used. Tracker.gg does not know what an ability hit.",
+        )
 
 
 def main() -> None:

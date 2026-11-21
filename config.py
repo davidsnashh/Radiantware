@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, ValidationError, model_validator
+from pydantic import AliasChoices, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     )
     flaresolverr_timeout_ms: int = Field(60_000, ge=1_000)
 
+    # Folder with replay files for the replay tools. Unset means the game's own
+    # folder, which only exists on Windows.
+    replay_dir: Path | None = None
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     transport: Literal["stdio", "streamable-http"] = Field(
@@ -73,6 +77,15 @@ class Settings(BaseSettings):
     )
     host: str = Field("127.0.0.1", validation_alias="MCP_HOST")
     port: int = Field(8000, validation_alias="MCP_PORT", ge=1, le=65535)
+
+    @field_validator("data_dir", "replay_dir", "browser_executable")
+    @classmethod
+    def _expand_home(cls, value: Path | None) -> Path | None:
+        """A path may start with ~, which nothing else expands when it comes from .env."""
+        try:
+            return None if value is None else value.expanduser()
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from None
 
     @model_validator(mode="after")
     def _check_delays(self) -> Settings:

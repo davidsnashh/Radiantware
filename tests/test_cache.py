@@ -196,6 +196,15 @@ def test_invalidate_without_a_filter_empties_the_cache(store):
     assert asyncio.run(store.invalidate()) == 0
 
 
+def test_an_entry_past_the_grace_period_is_not_served_even_as_stale(store, clock):
+    put(store, "overview", "old", 10, ME)
+    # Grace is 100 seconds, counted from the end of the entry's 10.
+    clock.advance(110)
+    assert value_of(store, "overview", ME, allow_stale=True) == "old"
+    clock.advance(1)
+    assert get(store, "overview", ME, allow_stale=True) is None
+
+
 def test_purge_only_drops_entries_past_the_stale_grace_period(store, clock):
     put(store, "long gone", 1, 10)
     put(store, "just expired", 2, 150)

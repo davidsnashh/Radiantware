@@ -1,6 +1,6 @@
 [project]
 name = "valorant-trn-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "Personal-use MCP server for Valorant stats scraped from tracker.gg"
 readme = "README.md"
 requires-python = ">=3.11"

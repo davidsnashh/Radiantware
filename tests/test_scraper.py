@@ -55,6 +55,23 @@ def no_retry_jitter(monkeypatch):
     monkeypatch.setattr(trn.random, "random", lambda: 0.0)
 
 
+class Clock:
+    """The wall clock, which a test can move."""
+
+    def __init__(self):
+        self.real, self.ahead = time.time, 0.0
+
+    def __call__(self):
+        return self.real() + self.ahead
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    moved = Clock()
+    monkeypatch.setattr(time, "time", moved)
+    return moved
+
+
 def scraper(folder, *backends, **settings):
     options = {"min_delay": 0, "max_delay": 0, "backoff_base": 0, "max_requests_per_hour": 0}
     client = TrackerScraper(Settings(_env_file=None, data_dir=folder, **(options | settings)))
@@ -123,10 +140,252 @@ def test_a_retry_that_works_returns_the_data(tmp_path):
     assert backend.calls == 2
 
 
-def test_a_rate_limit_from_the_site_is_retried(tmp_path):
-    backend = FakeBackend("browser", FetchResult(429, ""), answer({"ok": 1}))
+def rate_limited_then(*results):
+    return FakeBackend("browser", FetchResult(429, ""), *results)
 
-    assert get(scraper(tmp_path, backend)) == {"ok": 1}
+
+def test_a_rate_limit_from_the_site_is_not_retried(tmp_path):
+    backend = rate_limited_then(answer({"ok": 1}))
+
+    with pytest.raises(RateLimitedError, match="rate limiting this connection"):
+        get(scraper(tmp_path, backend))
+    assert backend.calls == 1
+
+
+def test_nothing_is_requested_while_the_site_is_rate_limiting(tmp_path):
+    backend = rate_limited_then(answer({"ok": 1}))
+    client = scraper(tmp_path, backend)
+    with pytest.raises(RateLimitedError):
+        get(client)
+
+    with pytest.raises(RateLimitedError, match="paused for another 5 min"):
+        get(client)
+    assert backend.calls == 1
+
+
+def pause_left(client):
+    return client._pause_state()[0] - time.time()
+
+
+def turn_is_free(folder):
+    free = try_lock(folder / "pacing.lock")
+    if free is not None:
+        free.close()
+    return free is not None
+
+
+def test_requests_go_on_once_the_pause_is_over(tmp_path, clock):
+    backend = rate_limited_then(answer({"ok": 1}))
+    client = scraper(tmp_path, backend)
+    with pytest.raises(RateLimitedError):
+        get(client)
+
+    clock.ahead += 301
+
+    assert get(client) == {"ok": 1}
+
+
+def test_the_pause_doubles_up_to_an_hour_while_the_site_keeps_rate_limiting(tmp_path, clock):
+    client = scraper(tmp_path, FakeBackend("browser", *[FetchResult(429, "")] * 6))
+    pauses = []
+    for _ in range(6):
+        with pytest.raises(RateLimitedError):
+            get(client)
+        pauses.append(round(pause_left(client)))
+        clock.ahead += pauses[-1] + 1
+
+    assert pauses == [300, 600, 1200, 2400, 3600, 3600]
+
+
+def test_one_answer_that_works_makes_the_next_pause_short_again(tmp_path, clock):
+    backend = rate_limited_then(FetchResult(429, ""), answer({"ok": 1}), FetchResult(429, ""))
+    client = scraper(tmp_path, backend)
+    for _ in range(2):
+        with pytest.raises(RateLimitedError):
+            get(client)
+        clock.ahead += 601
+    get(client)
+
+    with pytest.raises(RateLimitedError):
+        get(client)
+    assert round(pause_left(client)) == 300
+
+
+def test_refusals_in_one_burst_count_once(tmp_path):
+    client = scraper(tmp_path)
+    client._pause()
+    client._pause()
+
+    assert round(pause_left(client)) == 300
+
+
+def test_a_rate_limit_after_a_failure_ends_the_retries_and_starts_the_pause(tmp_path):
+    backend = FakeBackend(
+        "browser", FetchResult(500, "oops"), FetchResult(429, ""), answer({"ok": 1})
+    )
+    client = scraper(tmp_path, backend, max_retries=3)
+
+    with pytest.raises(RateLimitedError):
+        get(client)
+    assert backend.calls == 2
+    assert pause_left(client) > 0
+
+
+def test_another_copy_holds_back_as_well(tmp_path):
+    one = scraper(tmp_path, rate_limited_then())
+    waiting = FakeBackend("browser", answer({"ok": 1}))
+    other = scraper(tmp_path, waiting)
+    with pytest.raises(RateLimitedError):
+        get(one)
+
+    with pytest.raises(RateLimitedError, match="paused for another 5 min"):
+        get(other)
+    assert waiting.calls == 0
+
+
+def test_the_pause_outlasts_a_restart(tmp_path):
+    with pytest.raises(RateLimitedError):
+        get(scraper(tmp_path, rate_limited_then()))
+    backend = FakeBackend("browser", answer({"ok": 1}))
+
+    with pytest.raises(RateLimitedError, match="paused"):
+        get(scraper(tmp_path, backend))
+    assert backend.calls == 0
+
+
+def test_copies_count_the_rate_limits_in_a_row_together(tmp_path, clock):
+    one, other = scraper(tmp_path, rate_limited_then()), scraper(tmp_path, rate_limited_then())
+    with pytest.raises(RateLimitedError):
+        get(one)
+    clock.ahead += 301
+
+    with pytest.raises(RateLimitedError):
+        get(other)
+    assert round(pause_left(one)) == 600
+
+
+def test_an_answer_that_works_in_one_copy_ends_the_count_for_all(tmp_path, clock):
+    one = scraper(tmp_path, rate_limited_then(FetchResult(429, "")))
+    other = scraper(tmp_path, FakeBackend("browser", answer({"ok": 1})))
+    with pytest.raises(RateLimitedError):
+        get(one)
+    clock.ahead += 301
+    get(other)
+
+    with pytest.raises(RateLimitedError):
+        get(one)
+    assert round(pause_left(one)) == 300
+
+
+class RateLimitedSlowly:
+    name = "browser"
+
+    async def fetch(self, url):
+        await asyncio.sleep(0.05)
+        return FetchResult(429, "")
+
+    async def close(self):
+        pass
+
+
+def test_a_copy_that_was_waiting_its_turn_sends_nothing_once_the_pause_began(tmp_path):
+    waiting = FakeBackend("browser", answer({"ok": 1}))
+    one, other = scraper(tmp_path, RateLimitedSlowly()), scraper(tmp_path, waiting)
+
+    async def both():
+        url = "https://example.invalid/data"
+        return await asyncio.gather(
+            one._get(url, "data", "x"), other._get(url, "data", "x"), return_exceptions=True
+        )
+
+    first, second = asyncio.run(both())
+
+    assert isinstance(first, RateLimitedError)
+    assert isinstance(second, RateLimitedError) and "paused" in str(second)
+    assert waiting.calls == 0
+    assert turn_is_free(tmp_path)
+
+
+def test_an_answer_that_was_under_way_does_not_end_a_pause(tmp_path):
+    other = scraper(tmp_path)
+
+    class AnswersLate:
+        name = "browser"
+
+        async def fetch(self, url):
+            # Another copy is refused while this request is under way.
+            other._pause()
+            return answer({"ok": 1})
+
+        async def close(self):
+            pass
+
+    client = scraper(tmp_path, AnswersLate())
+
+    assert get(client) == {"ok": 1}
+    assert pause_left(client) > 0
+
+
+def test_a_clock_that_was_set_back_does_not_stretch_the_pause(tmp_path, clock):
+    client = scraper(tmp_path, FakeBackend("browser", answer({"ok": 1})))
+    client._pause()
+    clock.ahead -= 86400
+
+    assert round(pause_left(client)) == 3600
+    clock.ahead += 3601
+    assert get(client) == {"ok": 1}
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "not json", "[1, 2]", '{"until": "soon"}', '{"until": 1e999, "in_a_row": 1e999}'],
+)
+def test_a_pause_file_that_cannot_be_read_is_ignored(tmp_path, content):
+    (tmp_path / "rate-limit.json").write_text(content)
+    client = scraper(tmp_path, FakeBackend("browser", answer({"ok": 1})))
+
+    assert get(client) == {"ok": 1}
+
+
+def test_the_pause_holds_for_this_copy_when_it_cannot_be_written_down(tmp_path):
+    backend = rate_limited_then(answer({"ok": 1}))
+    client = scraper(tmp_path, backend)
+    (tmp_path / "in-the-way").write_text("")
+    client._pause_file = tmp_path / "in-the-way" / "rate-limit.json"
+    with pytest.raises(RateLimitedError):
+        get(client)
+
+    with pytest.raises(RateLimitedError, match="paused"):
+        get(client)
+    assert backend.calls == 1
+
+
+def test_the_turn_is_free_after_a_request_refused_by_the_pause(tmp_path):
+    client = scraper(tmp_path, rate_limited_then())
+    for _ in range(2):
+        with pytest.raises(RateLimitedError):
+            get(client)
+
+    assert turn_is_free(tmp_path)
+
+
+def test_a_spent_local_budget_does_not_start_a_pause(tmp_path):
+    backend = FakeBackend("browser", answer({"ok": 1}), answer({"ok": 2}))
+    client = scraper(tmp_path, backend, max_requests_per_hour=1)
+    get(client)
+    with pytest.raises(RateLimitedError, match="local budget"):
+        get(client)
+
+    assert pause_left(client) <= 0
+    assert not (tmp_path / "rate-limit.json").exists()
+
+
+def test_a_rate_limit_named_in_the_error_list_is_recognised(tmp_path):
+    backend = FakeBackend("browser", failure("RateLimitExceeded", 200), answer({"ok": 1}))
+
+    with pytest.raises(RateLimitedError):
+        get(scraper(tmp_path, backend))
+    assert backend.calls == 1
 
 
 def test_a_rate_limit_page_is_recognised(tmp_path):
@@ -255,6 +514,8 @@ def test_a_spent_budget_met_between_two_backends_is_not_retried(tmp_path):
         get(client)
     assert time.monotonic() - started < 1
     assert proxy.calls == 0
+    # A budget of our own that ran out is not tracker.gg asking for fewer requests.
+    assert pause_left(client) <= 0
 
 
 def test_two_copies_count_their_requests_together(tmp_path):

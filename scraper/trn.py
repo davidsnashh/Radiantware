@@ -71,6 +71,10 @@ _CHALLENGE_TITLES = ("just a moment", "attention required", "access denied")
 
 # How long a backend is left alone after Cloudflare blocked it.
 _BLOCK_COOLDOWN = 300.0
+# How long nothing is requested after tracker.gg said it is rate limiting, and how
+# long at most when it keeps saying so. The pause doubles each time in a row.
+_RATE_LIMIT_PAUSE = 300.0
+_RATE_LIMIT_PAUSE_MAX = 3600.0
 
 # Chrome will not share a profile, so copies of the server that have a browser
 # open at the same time each take one of these.
@@ -517,6 +521,7 @@ class RequestPacer:
         self._shared = folder / "pacing.json" if folder else None
         self._shared_last = 0.0
         self._shared_recent: list[float] = []
+        self._own_start: float | None = None
         self._turn: IO[bytes] | None = None
 
     async def wait(self) -> None:
@@ -524,21 +529,24 @@ class RequestPacer:
             turn, self._turn = self._turn, None
             gap = random.uniform(self._min_delay, self._max_delay)
             deadline = time.monotonic() + self._turn_timeout
-            while True:
-                if turn is None and time.monotonic() < deadline:
-                    turn = await self._take_turn(deadline)
-                try:
+            try:
+                while True:
+                    if turn is None and time.monotonic() < deadline:
+                        turn = await self._take_turn(deadline)
                     remaining = self._remaining(gap)
                     if remaining <= 0:
                         self._record_start()
                         break
-                except BaseException:
-                    self._end_turn(turn)
-                    raise
-                # Given up for the length of the gap, so that the other copies get in.
+                    if self._went_last():
+                        # Given up for the length of the gap, so that a copy that is
+                        # waiting gets in. That copy keeps the turn while it waits, or
+                        # the one that just went could overtake it time after time.
+                        self._end_turn(turn)
+                        turn = None
+                    await asyncio.sleep(remaining)
+            except BaseException:
                 self._end_turn(turn)
-                turn = None
-                await asyncio.sleep(remaining)
+                raise
             if self._one_at_a_time:
                 # Kept until finished(), so other copies wait for the request itself too.
                 self._turn = turn
@@ -580,10 +588,15 @@ class RequestPacer:
             waits.append(self._shared_last + gap - now)
         return max(waits)
 
+    def _went_last(self) -> bool:
+        """Whether the latest request of all the copies was one of this copy's."""
+        mine = self._own_start
+        return mine is not None and all(start <= mine for start in self._shared_recent)
+
     def _record_start(self) -> None:
         self._last_activity = time.monotonic()
         self._recent.append(self._last_activity)
-        self._shared_last = time.time()
+        self._shared_last = self._own_start = time.time()
         self._shared_recent.append(self._shared_last)
         self._save()
 
@@ -604,7 +617,8 @@ class RequestPacer:
                     self._turn_timeout,
                 )
                 break
-            await asyncio.sleep(_TURN_POLL)
+            # Not in step with the other copies, or one could find the turn taken every time.
+            await asyncio.sleep(_TURN_POLL * random.uniform(0.5, 1.5))
         return None
 
     @staticmethod
@@ -673,7 +687,9 @@ def _raise_api_error(status: int, errors: list[Any], subject: Subject, label: st
         )
     if "InvalidParameters" in codes or status == 400:
         raise BadRequestError(f"Tracker.gg rejected the request for {label}: {message}")
-    if status == 429:
+    # By code as well, for a backend that hides the status. The names are a guess:
+    # no rate-limit answer in this form has been seen yet.
+    if status == 429 or "RateLimit" in codes or "TooManyRequests" in codes:
         raise RateLimitedError("Tracker.gg is rate limiting this connection. Try again later.")
     raise UpstreamError(f"Tracker.gg returned an error for {label}: {message}")
 
@@ -716,6 +732,11 @@ class TrackerScraper:
         self._settings = settings
         self._backends = self._build_backends(settings)
         self._blocked_until: dict[str, float] = {}
+        # Until when nothing is requested after a rate-limit answer, and how many of
+        # those came in a row. Kept in a file, so that other copies and the next start
+        # of the server hold back too, and here only when the file cannot be written.
+        self._pause_file = settings.data_dir / "rate-limit.json"
+        self._own_pause: tuple[float, int] = (0.0, 0)
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_scrapes)
         self._pacer = RequestPacer(
             settings.min_delay,
@@ -723,7 +744,8 @@ class TrackerScraper:
             settings.max_requests_per_hour,
             settings.data_dir,
             one_at_a_time=settings.max_concurrent_scrapes == 1,
-            turn_timeout=_longest_request(settings),
+            # A copy that is next in line holds the turn through its gap as well.
+            turn_timeout=_longest_request(settings) + settings.max_delay,
         )
 
     @staticmethod
@@ -831,21 +853,87 @@ class TrackerScraper:
         async with self._semaphore:
             retries = 0
             while True:
+                self._respect_pause()
                 # Outside the try: an exhausted local budget must not be retried.
                 await self._pacer.wait()
                 try:
-                    return await self._attempt(url, subject, label)
+                    # Another call may have been told to stop while this one waited.
+                    self._respect_pause()
+                except RateLimitedError:
+                    self._pacer.finished()
+                    raise
+                try:
+                    data = await self._attempt(url, subject, label)
                 except _BudgetUsedUp:
                     raise
-                except (UpstreamError, RateLimitedError) as exc:
+                except RateLimitedError:
+                    # Tracker.gg asked for fewer requests, so it gets none for a while.
+                    self._pause()
+                    raise
+                except UpstreamError as exc:
                     if retries >= self._settings.max_retries:
                         raise
                     delay = self._settings.backoff_base * 2**retries + random.random()
-                    if isinstance(exc, RateLimitedError):
-                        delay *= 5
                     retries += 1
                     log.warning("request failed (%s); retrying in %.1fs", exc, delay)
                     await asyncio.sleep(delay)
+                else:
+                    self._resume()
+                    return data
+
+    def _pause_state(self) -> tuple[float, int]:
+        """Until when requests are paused, and how many rate-limit answers came in a row."""
+        try:
+            saved = json.loads(self._pause_file.read_text())
+            shared = (float(saved["until"]), max(0, int(saved["in_a_row"])))
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            shared = (0.0, 0)
+        until, count = max(shared, self._own_pause)
+        latest = time.time() + _RATE_LIMIT_PAUSE_MAX
+        if until > latest:
+            # No pause is that long, so the clock was set back. It runs from now instead.
+            until = latest
+            self._keep_pause(until, count)
+        return until, count
+
+    def _keep_pause(self, until: float, count: int) -> None:
+        """Note a pause where every copy sees it, or failing that for this copy alone."""
+        try:
+            self._pause_file.parent.mkdir(parents=True, exist_ok=True)
+            self._pause_file.write_text(json.dumps({"until": until, "in_a_row": count}))
+        except OSError as exc:
+            self._own_pause = (until, count)
+            log.warning("the pause is not shared with other copies: %s", _first_line(exc))
+        else:
+            self._own_pause = (0.0, 0)
+
+    def _pause(self) -> None:
+        until, count = self._pause_state()
+        if until > time.time():
+            # This request was under way when the pause began. One burst counts once.
+            return
+        count += 1
+        pause = min(_RATE_LIMIT_PAUSE * 2 ** min(count - 1, 16), _RATE_LIMIT_PAUSE_MAX)
+        self._keep_pause(time.time() + pause, count)
+        log.warning("tracker.gg is rate limiting; no requests for %.0f minutes", pause / 60)
+
+    def _respect_pause(self) -> None:
+        left = self._pause_state()[0] - time.time()
+        if left > 0:
+            raise RateLimitedError(
+                "Tracker.gg is rate limiting this connection, so requests are paused for "
+                f"another {math.ceil(left / 60)} min."
+            )
+
+    def _resume(self) -> None:
+        """Forget the rate limiting once a request has gone through."""
+        until, count = self._pause_state()
+        if not count or until > time.time():
+            # Nothing to forget, or this request was under way when a pause began.
+            return
+        self._own_pause = (0.0, 0)
+        with contextlib.suppress(OSError):
+            self._pause_file.unlink(missing_ok=True)
 
     async def _attempt(self, url: str, subject: Subject, label: str) -> Any:
         try:
